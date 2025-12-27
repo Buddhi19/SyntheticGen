@@ -79,6 +79,19 @@ class ARG:
             help="Comma-separated GPU ids to expose via CUDA_VISIBLE_DEVICES.",
         )
         self.parser.add_argument(
+            "--launcher",
+            type=str,
+            default=None,
+            choices=["python", "accelerate"],
+            help="Launcher for training (defaults to accelerate when multiple GPUs are visible).",
+        )
+        self.parser.add_argument(
+            "--num_processes",
+            type=int,
+            default=None,
+            help="Number of processes for accelerate launch.",
+        )
+        self.parser.add_argument(
             "--dry_run",
             action="store_true",
             help="Print the resolved command without executing it.",
@@ -124,10 +137,15 @@ def _consume_forwarded_args(extra_args, args: argparse.Namespace):
         ("--save_dir", "save_dir"),
         ("--base_model", "base_model"),
         ("--gpus", "gpus"),
+        ("--launcher", "launcher"),
+        ("--num_processes", "num_processes"),
     ):
         value, extra_args = consume(flag)
         if value is not None:
-            setattr(args, attr, value)
+            if attr == "num_processes":
+                setattr(args, attr, int(value))
+            else:
+                setattr(args, attr, value)
     return extra_args, args
 
 
@@ -172,6 +190,30 @@ def main() -> None:
         gpus = args.gpus.replace(" ", "")
         if not gpus:
             raise ValueError("--gpus cannot be empty.")
+
+    launcher = args.launcher
+    if launcher is None and args.command in {"train_layout", "train_controlnet"}:
+        if gpus and len([gpu for gpu in gpus.split(",") if gpu]) > 1:
+            launcher = "accelerate"
+        else:
+            launcher = "python"
+    elif launcher is None:
+        launcher = "python"
+
+    if launcher == "accelerate":
+        if args.num_processes is None:
+            if gpus:
+                args.num_processes = len([gpu for gpu in gpus.split(",") if gpu])
+            else:
+                args.num_processes = 1
+        command = [
+            "accelerate",
+            "launch",
+            "--num_processes",
+            str(args.num_processes),
+            str(script_path),
+            *args.extra_args,
+        ]
     if args.dry_run:
         prefix = f"CUDA_VISIBLE_DEVICES={gpus} " if gpus else ""
         print(prefix + " ".join(command))

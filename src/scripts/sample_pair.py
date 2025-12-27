@@ -20,11 +20,13 @@ from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMSchedul
 
 try:
     from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from ..models.segmentation import SimpleSegNet
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from src.models.segmentation import SimpleSegNet
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,27 @@ def parse_args():
     parser.add_argument("--init_mask", type=str, default=None, help="Optional init mask (label map) for layout editing.")
     parser.add_argument("--strength_layout", type=float, default=0.8, help="Layout img2img strength (0..1).")
     parser.add_argument("--strength_image", type=float, default=0.8, help="Image img2img strength (0..1).")
+    parser.add_argument("--ignore_index", type=int, default=255, help="Ignore index value for init masks.")
+    parser.add_argument(
+        "--mask_format",
+        type=str,
+        default="indexed",
+        choices=["indexed", "loveda_raw"],
+        help="Mask format: indexed (0..K-1 with ignore) or LoveDA raw (0=ignore, 1..K).",
+    )
+    parser.add_argument(
+        "--seg_ckpt",
+        type=str,
+        default=None,
+        help="Optional segmentation checkpoint for auto init mask (image-only editing).",
+    )
+    parser.add_argument(
+        "--seg_arch",
+        type=str,
+        default="simple",
+        choices=["simple"],
+        help="Segmentation architecture for auto init mask.",
+    )
     parser.add_argument("--hist_guidance_scale", type=float, default=0.0, help="Histogram guidance scale for layouts.")
     parser.add_argument("--hist_guidance_temp", type=float, default=1.0, help="Softmax temperature for histogram guidance.")
     parser.add_argument("--num_inference_steps_layout", type=int, default=50)
@@ -186,9 +209,61 @@ def _load_init_mask(path: str, size: int) -> torch.Tensor:
     return torch.from_numpy(arr)
 
 
-def _onehot_from_mask(mask: torch.Tensor, num_classes: int) -> torch.Tensor:
-    safe = mask.clamp(min=0, max=num_classes - 1)
-    return F.one_hot(safe.long(), num_classes=num_classes).permute(2, 0, 1).float()
+def _resize_mask(mask: torch.Tensor, size: int) -> torch.Tensor:
+    if mask.shape[-2:] == (size, size):
+        return mask
+    mask = mask.unsqueeze(0).float()
+    mask = F.interpolate(mask, size=(size, size), mode="nearest").squeeze(0)
+    return mask.long()
+
+
+def _onehot_from_mask(
+    mask: torch.Tensor, num_classes: int, ignore_index: Optional[int], mask_format: str
+) -> torch.Tensor:
+    if mask_format == "loveda_raw":
+        mask = mask.clone()
+        ignore = mask == 0
+        mask = mask - 1
+        if ignore_index is None:
+            ignore_index = -1
+        mask[ignore] = ignore_index
+    elif mask_format != "indexed":
+        raise ValueError(f"Unsupported mask_format: {mask_format}")
+
+    if ignore_index is None:
+        valid = torch.ones_like(mask, dtype=torch.bool)
+    else:
+        valid = mask != ignore_index
+    safe = mask.clone()
+    safe[~valid] = 0
+    safe = safe.clamp(min=0, max=num_classes - 1)
+    onehot = F.one_hot(safe.long(), num_classes=num_classes).permute(2, 0, 1).float()
+    return onehot * valid.unsqueeze(0).float()
+
+
+def _load_segmentation_model(seg_arch: str, num_classes: int, ckpt_path: Optional[str], device: torch.device):
+    if seg_arch != "simple":
+        raise ValueError(f"Unsupported seg_arch: {seg_arch}")
+    if not ckpt_path:
+        raise ValueError("--seg_ckpt is required for image-only editing.")
+    model = SimpleSegNet(num_classes)
+    state = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(state, dict):
+        if "state_dict" in state:
+            state = state["state_dict"]
+        elif "model" in state:
+            state = state["model"]
+    model.load_state_dict(state)
+    model.to(device=device, dtype=torch.float32)
+    model.eval()
+    return model
+
+
+def _predict_mask_from_image(model, image: torch.Tensor, device: torch.device) -> torch.Tensor:
+    with torch.no_grad():
+        logits = model(image.to(device=device, dtype=torch.float32))
+        preds = torch.argmax(logits, dim=1)
+    return preds[0].detach().cpu()
 
 
 def _get_strength_timesteps(num_steps: int, strength: float) -> Tuple[int, int]:
@@ -236,14 +311,26 @@ def main():
     layout_unet.eval()
     layout_ratio_projector.eval()
 
-    if args.init_image and not args.init_mask:
-        raise ValueError("--init_image requires --init_mask for layout initialization.")
+    init_image_tensor = None
+    if args.init_image:
+        init_image_tensor = _load_init_image(args.init_image, args.image_size)
+
+    init_mask_tensor = None
+    mask_format = args.mask_format
+    if args.init_mask:
+        init_mask_tensor = _load_init_mask(args.init_mask, layout_size)
+    elif init_image_tensor is not None:
+        seg_model = _load_segmentation_model(args.seg_arch, num_classes, args.seg_ckpt, device)
+        seg_mask = _predict_mask_from_image(seg_model, init_image_tensor, device)
+        init_mask_tensor = _resize_mask(seg_mask, layout_size)
+        mask_format = "indexed"
 
     ratio_emb_layout = layout_ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
     layout_scheduler.set_timesteps(args.num_inference_steps_layout, device=device)
-    if args.init_mask:
-        init_mask = _load_init_mask(args.init_mask, layout_size).to(device)
-        layout_onehot_init = _onehot_from_mask(init_mask, num_classes).to(device, dtype=weight_dtype)
+    if init_mask_tensor is not None:
+        init_mask = init_mask_tensor.to(device)
+        layout_onehot_init = _onehot_from_mask(init_mask, num_classes, args.ignore_index, mask_format)
+        layout_onehot_init = layout_onehot_init.to(device, dtype=weight_dtype)
         layout_latents = layout_onehot_init.unsqueeze(0) * 2.0 - 1.0
         _, t_start = _get_strength_timesteps(args.num_inference_steps_layout, args.strength_layout)
         timesteps = layout_scheduler.timesteps[t_start:]
@@ -268,14 +355,21 @@ def main():
         timesteps = layout_scheduler.timesteps
 
     ratios_device = ratios.to(device=device, dtype=weight_dtype)
+    alphas_cumprod = layout_scheduler.alphas_cumprod.to(device=device, dtype=layout_latents.dtype)
     with torch.no_grad():
         for timestep in timesteps:
             noise_pred = layout_unet(layout_latents, timestep, class_labels=ratio_emb_layout).sample
-            layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
             if args.hist_guidance_scale > 0:
-                probs = torch.softmax(layout_latents / args.hist_guidance_temp, dim=1)
+                t_index = timestep.long() if isinstance(timestep, torch.Tensor) else int(timestep)
+                alpha_prod = alphas_cumprod[t_index].view(1, 1, 1, 1)
+                sqrt_alpha = alpha_prod.sqrt()
+                sqrt_one_minus = (1 - alpha_prod).sqrt()
+                x0_pred = (layout_latents - sqrt_one_minus * noise_pred) / sqrt_alpha
+                probs = torch.softmax(x0_pred / args.hist_guidance_temp, dim=1)
                 r_hat = probs.mean(dim=(2, 3))
                 delta = (ratios_device - r_hat).view(1, num_classes, 1, 1)
+            layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
+            if args.hist_guidance_scale > 0:
                 layout_latents = layout_latents + args.hist_guidance_scale * delta
 
     layout_ids_64 = layout_latents.argmax(dim=1)
@@ -338,7 +432,9 @@ def main():
     layout_cond = layout_onehot_512.to(device=device, dtype=weight_dtype)
     scheduler.set_timesteps(args.num_inference_steps_image, device=device)
     if args.init_image:
-        init_image = _load_init_image(args.init_image, args.image_size).to(device=device, dtype=weight_dtype)
+        if init_image_tensor is None:
+            init_image_tensor = _load_init_image(args.init_image, args.image_size)
+        init_image = init_image_tensor.to(device=device, dtype=weight_dtype)
         with torch.no_grad():
             latents = vae.encode(init_image).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
