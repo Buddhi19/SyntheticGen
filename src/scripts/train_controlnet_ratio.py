@@ -9,8 +9,10 @@ import logging
 import math
 import os
 from itertools import chain
+from pathlib import Path
 
 import accelerate
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,19 +20,20 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from packaging import version
+from PIL import Image
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from diffusers import AutoencoderKL, ControlNetModel, DDPMScheduler, UNet2DConditionModel
+from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
-from dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-from ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
 
 
-check_min_version("0.37.0.dev0")
+check_min_version("0.36.0")
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -85,6 +88,8 @@ def parse_args():
     parser.add_argument("--checkpointing_steps", type=int, default=500)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--sample_num_inference_steps", type=int, default=30)
+    parser.add_argument("--sample_seed", type=int, default=0)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -129,6 +134,115 @@ def _resolve_dataset(args, num_classes):
 def _ensure_identity_class_embedding(model):
     model.register_to_config(class_embed_type="identity", num_class_embeds=None, projection_class_embeddings_input_dim=None)
     model.class_embedding = nn.Identity()
+
+
+def _get_tb_writer(accelerator: Accelerator):
+    try:
+        tracker = accelerator.get_tracker("tensorboard")
+    except Exception:
+        return None
+    if tracker is None:
+        return None
+    return getattr(tracker, "writer", None)
+
+
+def _build_palette(num_classes: int) -> np.ndarray:
+    rng = np.random.default_rng(0)
+    colors = rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
+    colors[0] = np.array([0, 0, 0], dtype=np.uint8)
+    return colors
+
+
+def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
+    labels = label_map.detach().cpu().numpy().astype(np.int64)
+    return palette[labels]
+
+
+def _vae_decode(vae: AutoencoderKL, latents: torch.Tensor) -> torch.Tensor:
+    decoded = vae.decode(latents)
+    if isinstance(decoded, torch.Tensor):
+        return decoded
+    if hasattr(decoded, "sample"):
+        return decoded.sample
+    if isinstance(decoded, (tuple, list)) and decoded:
+        return decoded[0]
+    raise TypeError(f"Unexpected VAE decode output type: {type(decoded)}")
+
+
+def _save_uint8_rgb(image: torch.Tensor, save_path: Path) -> np.ndarray:
+    image = image.detach().cpu()
+    image = (image / 2.0 + 0.5).clamp(0, 1)
+    array = (image.permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+    Image.fromarray(array, mode="RGB").save(save_path)
+    return array
+
+
+def _log_controlnet_sample(
+    accelerator: Accelerator,
+    controlnet: ControlNetModel,
+    unet: UNet2DConditionModel,
+    vae: AutoencoderKL,
+    prompt_embeds: torch.Tensor,
+    ratio_projector: RatioProjector,
+    film_gate: ResidualFiLMGate,
+    scheduler: DDIMScheduler,
+    layouts: torch.Tensor,
+    ratios: torch.Tensor,
+    output_dir: str,
+    step: int,
+    seed: int,
+    palette: np.ndarray,
+    num_inference_steps: int,
+) -> None:
+    writer = _get_tb_writer(accelerator)
+    generator = torch.Generator(device=layouts.device).manual_seed(seed)
+
+    ratio_emb = ratio_projector(ratios.unsqueeze(0)).to(dtype=prompt_embeds.dtype)
+    latents = torch.randn(
+        (1, unet.config.in_channels, layouts.shape[-1] // 8, layouts.shape[-1] // 8),
+        generator=generator,
+        device=layouts.device,
+        dtype=prompt_embeds.dtype,
+    )
+    latents = latents * scheduler.init_noise_sigma
+    scheduler.set_timesteps(num_inference_steps, device=layouts.device)
+
+    with torch.no_grad():
+        for timestep in scheduler.timesteps:
+            down_samples, mid_sample = controlnet(
+                latents,
+                timestep,
+                encoder_hidden_states=prompt_embeds,
+                controlnet_cond=layouts,
+                class_labels=ratio_emb,
+                return_dict=False,
+            )
+            down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
+            noise_pred = unet(
+                latents,
+                timestep,
+                encoder_hidden_states=prompt_embeds,
+                class_labels=ratio_emb,
+                down_block_additional_residuals=down_samples,
+                mid_block_additional_residual=mid_sample,
+            ).sample
+            latents = scheduler.step(noise_pred, timestep, latents).prev_sample
+
+    image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
+
+    samples_dir = Path(output_dir) / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    image_path = samples_dir / f"image_step_{step:06d}.png"
+    image_array = _save_uint8_rgb(image, image_path)
+
+    layout_ids = layouts.argmax(dim=1)[0]
+    layout_color = _colorize_labels(layout_ids, palette)
+    layout_path = samples_dir / f"layout_step_{step:06d}.png"
+    Image.fromarray(layout_color, mode="RGB").save(layout_path)
+
+    if writer is not None:
+        writer.add_image("samples/image", image_array, step, dataformats="HWC")
+        writer.add_image("samples/layout", layout_color, step, dataformats="HWC")
 
 
 def main():
@@ -176,11 +290,11 @@ def main():
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    sample_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
     _ensure_identity_class_embedding(unet)
     controlnet = ControlNetModel.from_unet(unet, conditioning_channels=num_classes)
-    if controlnet.class_embedding is None:
-        _ensure_identity_class_embedding(controlnet)
+    _ensure_identity_class_embedding(controlnet)
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -248,6 +362,8 @@ def main():
     with torch.no_grad():
         prompt_embeds = text_encoder(text_inputs.input_ids.to(accelerator.device))[0]
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
+
+    palette = _build_palette(num_classes)
 
     global_step = 0
     first_epoch = 0
@@ -324,6 +440,33 @@ def main():
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
+                        layouts_sample = layouts[:1].detach()
+                        ratios_sample = ratios[0].detach()
+                        was_training = controlnet.training
+                        controlnet.eval()
+                        ratio_projector.eval()
+                        film_gate.eval()
+                        _log_controlnet_sample(
+                            accelerator=accelerator,
+                            controlnet=accelerator.unwrap_model(controlnet),
+                            unet=unet,
+                            vae=vae,
+                            prompt_embeds=prompt_embeds,
+                            ratio_projector=accelerator.unwrap_model(ratio_projector),
+                            film_gate=accelerator.unwrap_model(film_gate),
+                            scheduler=sample_scheduler,
+                            layouts=layouts_sample,
+                            ratios=ratios_sample,
+                            output_dir=args.output_dir,
+                            step=global_step,
+                            seed=args.sample_seed,
+                            palette=palette,
+                            num_inference_steps=args.sample_num_inference_steps,
+                        )
+                        if was_training:
+                            controlnet.train()
+                            ratio_projector.train()
+                            film_gate.train()
 
             if global_step >= args.max_train_steps:
                 break

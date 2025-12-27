@@ -4,13 +4,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-main_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+main_dir = Path(__file__).resolve().parents[2]
 
-DEFAULT_SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = "/data/inr/llm/Datasets/LOVEDA"
-DEFAULT_LAYOUT_DIR = os.path.join(main_dir, "outputs", "layout_ddpm")
-DEFAULT_CONTROLNET_DIR = os.path.join(main_dir, "outputs", "controlnet_ratio")
-DEFAULT_SAVE_DIR = os.path.join(main_dir, "outputs", "synthetic_pairs")
+DEFAULT_LAYOUT_DIR = os.path.join(str(main_dir), "outputs", "layout_ddpm")
+DEFAULT_CONTROLNET_DIR = os.path.join(str(main_dir), "outputs", "controlnet_ratio")
+DEFAULT_SAVE_DIR = os.path.join(str(main_dir), "outputs", "synthetic_pairs")
 
 
 class ARG:
@@ -23,12 +22,6 @@ class ARG:
             "command",
             choices=["train_layout", "train_controlnet", "sample"],
             help="Which script to run.",
-        )
-        self.parser.add_argument(
-            "--script_dir",
-            type=str,
-            default=str(DEFAULT_SCRIPT_DIR),
-            help="Path to the SyntheticGen scripts.",
         )
         self.parser.add_argument(
             "--data_root",
@@ -99,21 +92,6 @@ class ARG:
         return args
 
 
-def resolve_script(script_dir: str, command: str) -> Path:
-    if command == "train_layout":
-        script_name = "train_layout_ddpm.py"
-    elif command == "train_controlnet":
-        script_name = "train_controlnet_ratio.py"
-    else:
-        script_name = "sample_pair.py"
-    script_path = Path(script_dir) / script_name
-    if not script_path.is_file():
-        raise FileNotFoundError(
-            f"Could not find {script_name} at {script_path}. Use --script_dir to set the path."
-        )
-    return script_path
-
-
 def _flag_present(extra_args, flag: str) -> bool:
     return any(arg == flag or arg.startswith(f"{flag}=") for arg in extra_args)
 
@@ -128,8 +106,13 @@ def _append_if_missing(command, extra_args, flag: str, value: str) -> None:
 
 def main() -> None:
     args = ARG().parse()
-    script_path = resolve_script(args.script_dir, args.command)
-    command = [sys.executable, str(script_path), *args.extra_args]
+    modules = {
+        "train_layout": "src.scripts.train_layout_ddpm",
+        "train_controlnet": "src.scripts.train_controlnet_ratio",
+        "sample": "src.scripts.sample_pair",
+    }
+    module = modules[args.command]
+    command = [sys.executable, "-m", module, *args.extra_args]
     if args.command == "train_layout":
         _append_if_missing(command, args.extra_args, "--data_root", args.data_root)
         _append_if_missing(command, args.extra_args, "--dataset", args.dataset)

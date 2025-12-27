@@ -34,11 +34,11 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.utils import check_min_version
 
-from dataset_loveda import load_class_names
+from .dataset_loveda import load_class_names
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.37.0.dev0")
+check_min_version("0.36.0")
 
 logger = logging.getLogger(__name__)
 

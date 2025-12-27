@@ -8,17 +8,17 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel, UNet2DModel
 
-from ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,12 @@ def parse_args():
     parser.add_argument("--ratios_json", type=str, default=None, help="JSON file with ratios list/dict.")
     parser.add_argument("--class_names_json", type=str, default=None, help="Optional class names JSON.")
     parser.add_argument("--prompt", type=str, default=None, help="Prompt for image sampling.")
+    parser.add_argument("--init_image", type=str, default=None, help="Optional init image for img2img editing.")
+    parser.add_argument("--init_mask", type=str, default=None, help="Optional init mask (label map) for layout editing.")
+    parser.add_argument("--strength_layout", type=float, default=0.8, help="Layout img2img strength (0..1).")
+    parser.add_argument("--strength_image", type=float, default=0.8, help="Image img2img strength (0..1).")
+    parser.add_argument("--hist_guidance_scale", type=float, default=0.0, help="Histogram guidance scale for layouts.")
+    parser.add_argument("--hist_guidance_temp", type=float, default=1.0, help="Softmax temperature for histogram guidance.")
     parser.add_argument("--num_inference_steps_layout", type=int, default=50)
     parser.add_argument("--num_inference_steps_image", type=int, default=30)
     parser.add_argument("--image_size", type=int, default=512)
@@ -148,6 +154,45 @@ def _load_ratio_projector(checkpoint_dir: Path, num_classes: int, embed_dim: int
     return projector
 
 
+def _ensure_identity_class_embedding(model) -> None:
+    model.register_to_config(class_embed_type="identity", num_class_embeds=None, projection_class_embeddings_input_dim=None)
+    model.class_embedding = torch.nn.Identity()
+
+
+def _load_init_image(path: str, image_size: int) -> torch.Tensor:
+    image = Image.open(path)
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    image = image.resize((image_size, image_size), resample=Image.BILINEAR)
+    arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
+    tensor = torch.from_numpy(arr).permute(2, 0, 1)
+    return tensor.unsqueeze(0)
+
+
+def _load_init_mask(path: str, size: int) -> torch.Tensor:
+    mask = Image.open(path)
+    mask = ImageOps.exif_transpose(mask)
+    if mask.mode not in {"L", "P"}:
+        mask = mask.convert("L")
+    mask = mask.resize((size, size), resample=Image.NEAREST)
+    arr = np.asarray(mask, dtype=np.int64)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    return torch.from_numpy(arr)
+
+
+def _onehot_from_mask(mask: torch.Tensor, num_classes: int) -> torch.Tensor:
+    safe = mask.clamp(min=0, max=num_classes - 1)
+    return F.one_hot(safe.long(), num_classes=num_classes).permute(2, 0, 1).float()
+
+
+def _get_strength_timesteps(num_steps: int, strength: float) -> Tuple[int, int]:
+    strength = min(max(strength, 0.0), 1.0)
+    init_timestep = int(num_steps * strength)
+    init_timestep = min(init_timestep, num_steps)
+    t_start = max(num_steps - init_timestep, 0)
+    return init_timestep, t_start
+
+
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -185,20 +230,47 @@ def main():
     layout_unet.eval()
     layout_ratio_projector.eval()
 
-    ratio_emb_layout = layout_ratio_projector(ratios.unsqueeze(0).to(device))
+    if args.init_image and not args.init_mask:
+        raise ValueError("--init_image requires --init_mask for layout initialization.")
 
-    layout_latents = torch.randn(
-        (1, num_classes, layout_size, layout_size),
-        generator=generator,
-        device=device,
-        dtype=weight_dtype,
-    )
-    layout_latents = layout_latents * layout_scheduler.init_noise_sigma
+    ratio_emb_layout = layout_ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
     layout_scheduler.set_timesteps(args.num_inference_steps_layout, device=device)
+    if args.init_mask:
+        init_mask = _load_init_mask(args.init_mask, layout_size).to(device)
+        layout_onehot_init = _onehot_from_mask(init_mask, num_classes).to(device, dtype=weight_dtype)
+        layout_latents = layout_onehot_init.unsqueeze(0) * 2.0 - 1.0
+        _, t_start = _get_strength_timesteps(args.num_inference_steps_layout, args.strength_layout)
+        timesteps = layout_scheduler.timesteps[t_start:]
+        if len(timesteps) == 0:
+            timesteps = []
+        else:
+            noise = torch.randn(
+                layout_latents.shape,
+                generator=generator,
+                device=device,
+                dtype=layout_latents.dtype,
+            )
+            layout_latents = layout_scheduler.add_noise(layout_latents, noise, timesteps[0])
+    else:
+        layout_latents = torch.randn(
+            (1, num_classes, layout_size, layout_size),
+            generator=generator,
+            device=device,
+            dtype=weight_dtype,
+        )
+        layout_latents = layout_latents * layout_scheduler.init_noise_sigma
+        timesteps = layout_scheduler.timesteps
+
+    ratios_device = ratios.to(device=device, dtype=weight_dtype)
     with torch.no_grad():
-        for timestep in layout_scheduler.timesteps:
+        for timestep in timesteps:
             noise_pred = layout_unet(layout_latents, timestep, class_labels=ratio_emb_layout).sample
             layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
+            if args.hist_guidance_scale > 0:
+                probs = torch.softmax(layout_latents / args.hist_guidance_temp, dim=1)
+                r_hat = probs.mean(dim=(2, 3))
+                delta = (ratios_device - r_hat).view(1, num_classes, 1, 1)
+                layout_latents = layout_latents + args.hist_guidance_scale * delta
 
     layout_ids_64 = layout_latents.argmax(dim=1)
     layout_onehot_64 = F.one_hot(layout_ids_64, num_classes=num_classes).permute(0, 3, 1, 2).float()
@@ -218,10 +290,8 @@ def main():
     unet = UNet2DConditionModel.from_pretrained(base_model, subfolder="unet", torch_dtype=weight_dtype)
     controlnet = ControlNetModel.from_pretrained(controlnet_ckpt / "controlnet", torch_dtype=weight_dtype)
 
-    unet.register_to_config(class_embed_type="identity", num_class_embeds=None, projection_class_embeddings_input_dim=None)
-    unet.class_embedding = torch.nn.Identity()
-    if controlnet.class_embedding is None:
-        controlnet.class_embedding = torch.nn.Identity()
+    _ensure_identity_class_embedding(unet)
+    _ensure_identity_class_embedding(controlnet)
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
     ratio_projector = _load_ratio_projector(controlnet_ckpt, num_classes, time_embed_dim)
@@ -258,23 +328,43 @@ def main():
         prompt_embeds = text_encoder(text_inputs.input_ids.to(device))[0]
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
 
-    ratio_emb = ratio_projector(ratios.unsqueeze(0).to(device))
-    latents = torch.randn(
-        (1, unet.config.in_channels, args.image_size // 8, args.image_size // 8),
-        generator=generator,
-        device=device,
-        dtype=weight_dtype,
-    )
-    latents = latents * scheduler.init_noise_sigma
+    ratio_emb = ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
+    layout_cond = layout_onehot_512.to(device=device, dtype=weight_dtype)
     scheduler.set_timesteps(args.num_inference_steps_image, device=device)
+    if args.init_image:
+        init_image = _load_init_image(args.init_image, args.image_size).to(device=device, dtype=weight_dtype)
+        with torch.no_grad():
+            latents = vae.encode(init_image).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor
+        _, t_start = _get_strength_timesteps(args.num_inference_steps_image, args.strength_image)
+        timesteps = scheduler.timesteps[t_start:]
+        if len(timesteps) == 0:
+            timesteps = []
+        else:
+            noise = torch.randn(
+                latents.shape,
+                generator=generator,
+                device=device,
+                dtype=latents.dtype,
+            )
+            latents = scheduler.add_noise(latents, noise, timesteps[0])
+    else:
+        latents = torch.randn(
+            (1, unet.config.in_channels, args.image_size // 8, args.image_size // 8),
+            generator=generator,
+            device=device,
+            dtype=weight_dtype,
+        )
+        latents = latents * scheduler.init_noise_sigma
+        timesteps = scheduler.timesteps
 
     with torch.no_grad():
-        for timestep in scheduler.timesteps:
+        for timestep in timesteps:
             down_samples, mid_sample = controlnet(
                 latents,
                 timestep,
                 encoder_hidden_states=prompt_embeds,
-                controlnet_cond=layout_onehot_512.to(device=device, dtype=weight_dtype),
+                controlnet_cond=layout_cond,
                 class_labels=ratio_emb,
                 return_dict=False,
             )

@@ -12,22 +12,24 @@ from itertools import chain
 from pathlib import Path
 
 import accelerate
+import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+from PIL import Image
 from tqdm.auto import tqdm
 
 from diffusers import DDPMScheduler, UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 
-from dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-from ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
+from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 
 
-check_min_version("0.37.0.dev0")
+check_min_version("0.36.0")
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -76,6 +78,10 @@ def parse_args():
     parser.add_argument("--checkpointing_steps", type=int, default=500)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--lambda_ratio", type=float, default=1.0)
+    parser.add_argument("--ratio_temp", type=float, default=1.0)
+    parser.add_argument("--sample_num_inference_steps", type=int, default=50)
+    parser.add_argument("--sample_seed", type=int, default=0)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -107,6 +113,7 @@ def _resolve_dataset(args, num_classes):
             ignore_index=args.ignore_index,
             num_classes=num_classes,
             return_layouts=True,
+            layout_size=args.layout_size,
         )
     return GenericSegDataset(
         args.data_root,
@@ -114,7 +121,71 @@ def _resolve_dataset(args, num_classes):
         num_classes=num_classes,
         ignore_index=None,
         return_layouts=True,
+        layout_size=args.layout_size,
     )
+
+
+def _get_tb_writer(accelerator: Accelerator):
+    try:
+        tracker = accelerator.get_tracker("tensorboard")
+    except Exception:
+        return None
+    if tracker is None:
+        return None
+    return getattr(tracker, "writer", None)
+
+
+def _build_palette(num_classes: int) -> np.ndarray:
+    rng = np.random.default_rng(0)
+    colors = rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
+    colors[0] = np.array([0, 0, 0], dtype=np.uint8)
+    return colors
+
+
+def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
+    labels = label_map.detach().cpu().numpy().astype(np.int64)
+    return palette[labels]
+
+
+def _log_layout_sample(
+    accelerator: Accelerator,
+    unet: UNet2DModel,
+    ratio_projector: RatioProjector,
+    noise_scheduler: DDPMScheduler,
+    ratios: torch.Tensor,
+    num_classes: int,
+    layout_size: int,
+    num_inference_steps: int,
+    output_dir: str,
+    step: int,
+    seed: int,
+) -> None:
+    writer = _get_tb_writer(accelerator)
+    palette = _build_palette(num_classes)
+    generator = torch.Generator(device=ratios.device).manual_seed(seed)
+    ratio_emb = ratio_projector(ratios.unsqueeze(0))
+    layout_latents = torch.randn(
+        (1, num_classes, layout_size, layout_size),
+        generator=generator,
+        device=ratios.device,
+        dtype=ratio_emb.dtype,
+    )
+    layout_latents = layout_latents * noise_scheduler.init_noise_sigma
+    noise_scheduler.set_timesteps(num_inference_steps, device=ratios.device)
+    with torch.no_grad():
+        for timestep in noise_scheduler.timesteps:
+            noise_pred = unet(layout_latents, timestep, class_labels=ratio_emb).sample
+            layout_latents = noise_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
+
+    layout_ids = layout_latents.argmax(dim=1)[0]
+    color = _colorize_labels(layout_ids, palette)
+    samples_dir = Path(output_dir) / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    sample_path = samples_dir / f"layout_step_{step:06d}.png"
+    Image.fromarray(color, mode="RGB").save(sample_path)
+
+    if writer is not None:
+        writer.add_image("samples/layout", color, step, dataformats="HWC")
 
 
 def main():
@@ -145,7 +216,8 @@ def main():
     def collate_fn(examples):
         layouts = torch.stack([ex["layout_64"] for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
-        return {"layout_64": layouts, "ratios": ratios}
+        valid64 = torch.stack([ex["valid_64"] for ex in examples])
+        return {"layout_64": layouts, "ratios": ratios, "valid_64": valid64}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -217,8 +289,10 @@ def main():
             with accelerator.accumulate(unet):
                 layouts = batch["layout_64"]
                 ratios = batch["ratios"]
+                valid64 = batch["valid_64"]
                 layouts = layouts.to(dtype=torch.float32)
                 ratios = ratios.to(dtype=torch.float32)
+                valid64 = valid64.to(dtype=torch.float32)
                 layouts = layouts * 2.0 - 1.0
 
                 noise = torch.randn_like(layouts)
@@ -229,7 +303,18 @@ def main():
 
                 ratio_emb = ratio_projector(ratios)
                 noise_pred = unet(noisy_layouts, timesteps, class_labels=ratio_emb).sample
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                alphas_cumprod = noise_scheduler.alphas_cumprod.to(noisy_layouts.device)
+                a = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                sqrt_a = a.sqrt()
+                sqrt_one_minus_a = (1 - a).sqrt()
+                x0_pred = (noisy_layouts - sqrt_one_minus_a * noise_pred) / sqrt_a
+                probs = torch.softmax(x0_pred / args.ratio_temp, dim=1)
+                weighted = (probs * valid64).sum(dim=(2, 3))
+                denom = valid64.sum(dim=(2, 3)).clamp(min=1.0)
+                r_hat = weighted / denom
+                ratio_loss = F.mse_loss(r_hat, ratios, reduction="mean")
+                denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                loss = denoise_loss + args.lambda_ratio * ratio_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -242,12 +327,39 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 if global_step % args.logging_steps == 0:
-                    accelerator.log({"train_loss": loss.detach().item()}, step=global_step)
+                    accelerator.log(
+                        {
+                            "train_loss": loss.detach().item(),
+                            "denoise_loss": denoise_loss.detach().item(),
+                            "ratio_loss": ratio_loss.detach().item(),
+                        },
+                        step=global_step,
+                    )
 
                 if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
+                        ratios_sample = ratios[0].detach()
+                        was_training = unet.training
+                        unet.eval()
+                        ratio_projector.eval()
+                        _log_layout_sample(
+                            accelerator=accelerator,
+                            unet=accelerator.unwrap_model(unet),
+                            ratio_projector=accelerator.unwrap_model(ratio_projector),
+                            noise_scheduler=noise_scheduler,
+                            ratios=ratios_sample,
+                            num_classes=num_classes,
+                            layout_size=args.layout_size,
+                            num_inference_steps=args.sample_num_inference_steps,
+                            output_dir=args.output_dir,
+                            step=global_step,
+                            seed=args.sample_seed,
+                        )
+                        if was_training:
+                            unet.train()
+                            ratio_projector.train()
 
             if global_step >= args.max_train_steps:
                 break

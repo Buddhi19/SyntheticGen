@@ -42,11 +42,11 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.37.0.dev0")
+check_min_version("0.36.0")
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -330,9 +330,17 @@ def main():
             split=args.loveda_split,
             domains=domains,
             ignore_index=args.ignore_index,
+            num_classes=args.num_classes,
+            return_layouts=False,
         )
     else:
-        train_dataset = GenericSegDataset(args.data_root, image_size=args.image_size)
+        train_dataset = GenericSegDataset(
+            args.data_root,
+            image_size=args.image_size,
+            num_classes=args.num_classes,
+            ignore_index=args.ignore_index,
+            return_layouts=False,
+        )
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["image"] for example in examples])

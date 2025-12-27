@@ -1,9 +1,11 @@
-accelerate>=0.16.0
-diffusers
 torch
 torchvision
-transformers>=4.25.1
-datasets
-ftfy
+accelerate
+transformers
+diffusers[torch]
 safetensors
+numpy
+Pillow
+tqdm
 tensorboard
+packaging
