@@ -6,10 +6,11 @@ from pathlib import Path
 
 main_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-DEFAULT_SCRIPT_DIR = Path(__file__).resolve().parents[1] / "SyntheticGen"
+DEFAULT_SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = "/data/inr/llm/Datasets/LOVEDA"
-DEFAULT_OUTPUT_DIR = os.path.join(main_dir, "outputs", "checkpoints")
-DEFAULT_SAVE_DIR = os.path.join(main_dir, "outputs", "synthetic_predictions")
+DEFAULT_LAYOUT_DIR = os.path.join(main_dir, "outputs", "layout_ddpm")
+DEFAULT_CONTROLNET_DIR = os.path.join(main_dir, "outputs", "controlnet_ratio")
+DEFAULT_SAVE_DIR = os.path.join(main_dir, "outputs", "synthetic_pairs")
 
 
 class ARG:
@@ -20,51 +21,63 @@ class ARG:
     def add_arguments(self) -> None:
         self.parser.add_argument(
             "command",
-            choices=["train", "synth"],
+            choices=["train_layout", "train_controlnet", "sample"],
             help="Which script to run.",
         )
         self.parser.add_argument(
             "--script_dir",
             type=str,
             default=str(DEFAULT_SCRIPT_DIR),
-            help="Path to the diffusers/examples/SyntheticGen scripts.",
+            help="Path to the SyntheticGen scripts.",
         )
         self.parser.add_argument(
             "--data_root",
             type=str,
             default=DEFAULT_DATA_ROOT,
-            help="Dataset root used for training (train only).",
+            help="Dataset root used for training.",
         )
         self.parser.add_argument(
             "--dataset",
             type=str,
             default="loveda",
             choices=["loveda", "generic"],
-            help="Dataset type for training/synthesis.",
+            help="Dataset type for training.",
         )
         self.parser.add_argument(
-            "--output_dir",
+            "--layout_output_dir",
             type=str,
-            default=DEFAULT_OUTPUT_DIR,
-            help="Output directory for checkpoints (train only).",
+            default=DEFAULT_LAYOUT_DIR,
+            help="Output directory for layout DDPM checkpoints.",
         )
         self.parser.add_argument(
-            "--checkpoint",
+            "--controlnet_output_dir",
             type=str,
-            default=DEFAULT_OUTPUT_DIR,
-            help="Checkpoint directory to load (synth only).",
+            default=DEFAULT_CONTROLNET_DIR,
+            help="Output directory for ControlNet checkpoints.",
         )
         self.parser.add_argument(
-            "--checkpoint_step",
-            type=int,
-            default=None,
-            help="If set, load UNet from checkpoint-<step> under --checkpoint (synth only).",
+            "--layout_ckpt",
+            type=str,
+            default=DEFAULT_LAYOUT_DIR,
+            help="Layout DDPM checkpoint directory.",
+        )
+        self.parser.add_argument(
+            "--controlnet_ckpt",
+            type=str,
+            default=DEFAULT_CONTROLNET_DIR,
+            help="ControlNet checkpoint directory.",
         )
         self.parser.add_argument(
             "--save_dir",
             type=str,
             default=DEFAULT_SAVE_DIR,
-            help="Output directory for generated samples (synth only).",
+            help="Output directory for generated samples.",
+        )
+        self.parser.add_argument(
+            "--base_model",
+            type=str,
+            default=None,
+            help="Base Stable Diffusion model path for ControlNet training/sampling.",
         )
         self.parser.add_argument(
             "--gpus",
@@ -87,10 +100,12 @@ class ARG:
 
 
 def resolve_script(script_dir: str, command: str) -> Path:
-    if command == "train":
-        script_name = "train_seg_mask_diffusion.py"
+    if command == "train_layout":
+        script_name = "train_layout_ddpm.py"
+    elif command == "train_controlnet":
+        script_name = "train_controlnet_ratio.py"
     else:
-        script_name = "generate_joint_image_mask_diffusion.py"
+        script_name = "sample_pair.py"
     script_path = Path(script_dir) / script_name
     if not script_path.is_file():
         raise FileNotFoundError(
@@ -115,15 +130,20 @@ def main() -> None:
     args = ARG().parse()
     script_path = resolve_script(args.script_dir, args.command)
     command = [sys.executable, str(script_path), *args.extra_args]
-    if args.command == "train":
+    if args.command == "train_layout":
         _append_if_missing(command, args.extra_args, "--data_root", args.data_root)
         _append_if_missing(command, args.extra_args, "--dataset", args.dataset)
-        _append_if_missing(command, args.extra_args, "--output_dir", args.output_dir)
-    else:
-        _append_if_missing(command, args.extra_args, "--checkpoint", args.checkpoint)
-        _append_if_missing(command, args.extra_args, "--checkpoint_step", args.checkpoint_step)
-        _append_if_missing(command, args.extra_args, "--save_dir", args.save_dir)
+        _append_if_missing(command, args.extra_args, "--output_dir", args.layout_output_dir)
+    elif args.command == "train_controlnet":
+        _append_if_missing(command, args.extra_args, "--data_root", args.data_root)
         _append_if_missing(command, args.extra_args, "--dataset", args.dataset)
+        _append_if_missing(command, args.extra_args, "--output_dir", args.controlnet_output_dir)
+        _append_if_missing(command, args.extra_args, "--pretrained_model_name_or_path", args.base_model)
+    else:
+        _append_if_missing(command, args.extra_args, "--layout_ckpt", args.layout_ckpt)
+        _append_if_missing(command, args.extra_args, "--controlnet_ckpt", args.controlnet_ckpt)
+        _append_if_missing(command, args.extra_args, "--save_dir", args.save_dir)
+        _append_if_missing(command, args.extra_args, "--base_model", args.base_model)
 
     gpus = None
     if args.gpus is not None:
@@ -141,38 +161,5 @@ def main() -> None:
     subprocess.run(command, check=True, env=env)
 
 
-def infer(
-    checkpoint: str = DEFAULT_OUTPUT_DIR,
-    checkpoint_step: int | None = None,
-    save_dir: str = DEFAULT_SAVE_DIR,
-    num_samples: int = 5,
-    dataset: str = "loveda",
-    gpus: str = "6,7",
-) -> None:
-    script_path = Path(DEFAULT_SCRIPT_DIR) / "generate_joint_image_mask_diffusion.py"
-    cmd = [
-        sys.executable,
-        str(script_path),
-        "--checkpoint",
-        checkpoint,
-    ]
-    if checkpoint_step is not None:
-        cmd.extend(["--checkpoint_step", str(checkpoint_step)])
-    cmd.extend(
-        [
-            "--save_dir",
-            save_dir,
-            "--num_samples",
-            str(num_samples),
-            "--dataset",
-            dataset,
-        ]
-    )
-    env = os.environ.copy()
-    if gpus:
-        env["CUDA_VISIBLE_DEVICES"] = gpus.replace(" ", "")
-    subprocess.run(cmd, check=True, env=env)
-
-
 if __name__ == "__main__":
-    infer()
+    main()

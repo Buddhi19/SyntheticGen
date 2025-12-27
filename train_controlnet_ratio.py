@@ -1,0 +1,362 @@
+#!/usr/bin/env python
+# coding=utf-8
+
+"""Train ControlNet with layout conditioning and ratio-based FiLM gating."""
+
+import argparse
+import json
+import logging
+import math
+import os
+from itertools import chain
+
+import accelerate
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed
+from packaging import version
+from tqdm.auto import tqdm
+from transformers import CLIPTextModel, CLIPTokenizer
+
+from diffusers import AutoencoderKL, ControlNetModel, DDPMScheduler, UNet2DConditionModel
+from diffusers.optimization import get_scheduler
+from diffusers.utils import check_min_version, is_wandb_available
+from diffusers.utils.import_utils import is_xformers_available
+
+from dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+from ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+
+
+check_min_version("0.37.0.dev0")
+
+logger = get_logger(__name__, log_level="INFO")
+
+if is_wandb_available():
+    import wandb  # noqa: F401
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train ControlNet with layout + ratio conditioning.")
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument("--output_dir", type=str, default="outputs/controlnet_ratio")
+    parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="generic",
+        choices=["loveda", "generic"],
+        help="Dataset type to use.",
+    )
+    parser.add_argument("--image_size", type=int, default=512, help="Training image size (square).")
+    parser.add_argument("--num_classes", type=int, default=None, help="Number of classes in the dataset.")
+    parser.add_argument("--class_names_json", type=str, default=None)
+    parser.add_argument("--ignore_index", type=int, default=255)
+    parser.add_argument("--loveda_split", type=str, default="Train")
+    parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
+    parser.add_argument("--prompt", type=str, default="a high-resolution satellite image")
+    parser.add_argument("--train_batch_size", type=int, default=2)
+    parser.add_argument("--num_train_epochs", type=int, default=50)
+    parser.add_argument("--max_train_steps", type=int, default=20000)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--scale_lr", action="store_true")
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+    )
+    parser.add_argument("--lr_warmup_steps", type=int, default=0)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-2)
+    parser.add_argument("--adam_epsilon", type=float, default=1e-08)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--dataloader_num_workers", type=int, default=4)
+    parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true")
+    parser.add_argument("--checkpointing_steps", type=int, default=500)
+    parser.add_argument("--checkpoints_total_limit", type=int, default=None)
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",
+        help="The integration to report to (tensorboard, wandb, or none).",
+    )
+    parser.add_argument("--logging_dir", type=str, default="logs")
+    parser.add_argument("--local_rank", type=int, default=-1)
+    args = parser.parse_args()
+
+    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if env_local_rank != -1 and env_local_rank != args.local_rank:
+        args.local_rank = env_local_rank
+
+    return args
+
+
+def _resolve_dataset(args, num_classes):
+    if args.dataset == "loveda":
+        domains = [domain.strip() for domain in args.loveda_domains.split(",") if domain.strip()]
+        return LoveDADataset(
+            args.data_root,
+            image_size=args.image_size,
+            split=args.loveda_split,
+            domains=domains,
+            ignore_index=args.ignore_index,
+            num_classes=num_classes,
+            return_layouts=True,
+        )
+    return GenericSegDataset(
+        args.data_root,
+        image_size=args.image_size,
+        num_classes=num_classes,
+        ignore_index=None,
+        return_layouts=True,
+    )
+
+
+def _ensure_identity_class_embedding(model):
+    model.register_to_config(class_embed_type="identity", num_class_embeds=None, projection_class_embeddings_input_dim=None)
+    model.class_embedding = nn.Identity()
+
+
+def main():
+    args = parse_args()
+
+    logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    log_with = None if args.report_to == "none" else args.report_to
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=log_with,
+        project_config=accelerator_project_config,
+    )
+
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
+
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    class_names, num_classes = load_class_names(args.class_names_json, args.num_classes, args.dataset)
+    args.num_classes = num_classes
+
+    train_dataset = _resolve_dataset(args, num_classes)
+
+    def collate_fn(examples):
+        pixel_values = torch.stack([ex["pixel_values"] for ex in examples])
+        layouts = torch.stack([ex["layout_512"] for ex in examples])
+        ratios = torch.stack([ex["ratios"] for ex in examples])
+        return {"pixel_values": pixel_values, "layout_512": layouts, "ratios": ratios}
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=True,
+    )
+
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+
+    _ensure_identity_class_embedding(unet)
+    controlnet = ControlNetModel.from_unet(unet, conditioning_channels=num_classes)
+    if controlnet.class_embedding is None:
+        _ensure_identity_class_embedding(controlnet)
+
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
+    unet.eval()
+    vae.eval()
+    text_encoder.eval()
+
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            if version.parse(torch.__version__) >= version.parse("1.13"):
+                unet.enable_xformers_memory_efficient_attention()
+                controlnet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+    time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
+    ratio_projector = RatioProjector(num_classes, time_embed_dim)
+    film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=len(controlnet.down_blocks))
+
+    if args.scale_lr:
+        args.learning_rate = args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size
+
+    optimizer = torch.optim.AdamW(
+        chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps,
+    )
+
+    controlnet, ratio_projector, film_gate, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        controlnet, ratio_projector, film_gate, optimizer, train_dataloader, lr_scheduler
+    )
+
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    vae.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    unet.to(accelerator.device, dtype=weight_dtype)
+
+    text_inputs = tokenizer(
+        [args.prompt],
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        prompt_embeds = text_encoder(text_inputs.input_ids.to(accelerator.device))[0]
+    prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
+
+    global_step = 0
+    first_epoch = 0
+    if args.resume_from_checkpoint:
+        accelerator.load_state(args.resume_from_checkpoint)
+        if os.path.basename(args.resume_from_checkpoint).startswith("checkpoint-"):
+            global_step = int(os.path.basename(args.resume_from_checkpoint).split("-")[1])
+            first_epoch = global_step // num_update_steps_per_epoch
+
+    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Steps")
+
+    for epoch in range(first_epoch, args.num_train_epochs):
+        controlnet.train()
+        ratio_projector.train()
+        film_gate.train()
+        for batch in train_dataloader:
+            with accelerator.accumulate(controlnet):
+                pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+                layouts = batch["layout_512"].to(dtype=weight_dtype)
+                ratios = batch["ratios"].to(dtype=weight_dtype)
+
+                with torch.no_grad():
+                    latents = vae.encode(pixel_values).latent_dist.sample()
+                    latents = latents * vae.config.scaling_factor
+
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device
+                ).long()
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                ratio_emb = ratio_projector(ratios)
+                prompt_batch = prompt_embeds.repeat(latents.shape[0], 1, 1)
+
+                down_samples, mid_sample = controlnet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=prompt_batch,
+                    controlnet_cond=layouts,
+                    class_labels=ratio_emb,
+                    return_dict=False,
+                )
+                down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
+
+                noise_pred = unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=prompt_batch,
+                    class_labels=ratio_emb,
+                    down_block_additional_residuals=down_samples,
+                    mid_block_additional_residual=mid_sample,
+                ).sample
+
+                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()),
+                        args.max_grad_norm,
+                    )
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                if global_step % args.logging_steps == 0:
+                    accelerator.log({"train_loss": loss.detach().item()}, step=global_step)
+
+                if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
+                    if accelerator.is_main_process:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+
+            if global_step >= args.max_train_steps:
+                break
+
+        if global_step >= args.max_train_steps:
+            break
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unwrapped_controlnet = accelerator.unwrap_model(controlnet)
+        unwrapped_ratio = accelerator.unwrap_model(ratio_projector)
+        unwrapped_gate = accelerator.unwrap_model(film_gate)
+        unwrapped_controlnet.save_pretrained(os.path.join(args.output_dir, "controlnet"))
+        torch.save(unwrapped_ratio.state_dict(), os.path.join(args.output_dir, "ratio_projector.bin"))
+        torch.save(unwrapped_gate.state_dict(), os.path.join(args.output_dir, "film_gate.bin"))
+        with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as handle:
+            json.dump(class_names, handle, indent=2)
+        with open(os.path.join(args.output_dir, "training_config.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "dataset": args.dataset,
+                    "num_classes": num_classes,
+                    "image_size": args.image_size,
+                    "ignore_index": args.ignore_index,
+                    "prompt": args.prompt,
+                    "base_model": args.pretrained_model_name_or_path,
+                },
+                handle,
+                indent=2,
+            )
+
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    main()

@@ -4,6 +4,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 
@@ -194,33 +195,80 @@ class _SegmentationDataset(Dataset):
         pairs: Sequence[Tuple[Path, Path]],
         image_size: int,
         label_remap: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        num_classes: Optional[int] = None,
+        ignore_index: Optional[int] = None,
+        return_layouts: bool = False,
     ):
         if not pairs:
             raise ValueError("No image/mask pairs found.")
         self.pairs = list(pairs)
         self.image_size = image_size
         self.label_remap = label_remap
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.return_layouts = return_layouts
 
     def __len__(self) -> int:
         return len(self.pairs)
 
     def __getitem__(self, index: int):
         image_path, mask_path = self.pairs[index]
-        return {
-            "image": _load_image(image_path, self.image_size),
-            "label": _load_label(mask_path, self.image_size, self.label_remap),
+        image = _load_image(image_path, self.image_size)
+        label = _load_label(mask_path, self.image_size, self.label_remap)
+        sample = {
+            "image": image,
+            "label": label,
+            "pixel_values": image,
+            "labels": label,
             "image_path": str(image_path),
             "label_path": str(mask_path),
         }
+        if self.return_layouts and self.num_classes is not None:
+            valid = torch.ones_like(label, dtype=torch.bool)
+            if self.ignore_index is not None:
+                valid = label != self.ignore_index
+            label_clamped = label.clone()
+            label_clamped[~valid] = 0
+            onehot = F.one_hot(label_clamped.long(), num_classes=self.num_classes).permute(2, 0, 1).float()
+            if self.ignore_index is not None:
+                onehot = onehot * valid.float().unsqueeze(0)
+            if valid.any():
+                flat = label[valid].view(-1)
+                counts = torch.bincount(flat.long(), minlength=self.num_classes).float()
+            else:
+                counts = torch.zeros(self.num_classes, dtype=torch.float32)
+            ratios = counts / counts.sum().clamp(min=1.0)
+            layout_64 = F.interpolate(onehot.unsqueeze(0), size=(64, 64), mode="nearest").squeeze(0)
+            sample.update(
+                {
+                    "layout_512": onehot,
+                    "layout_64": layout_64,
+                    "ratios": ratios,
+                }
+            )
+        return sample
 
 
 class GenericSegDataset(_SegmentationDataset):
-    def __init__(self, root: str, image_size: int):
+    def __init__(
+        self,
+        root: str,
+        image_size: int,
+        num_classes: Optional[int] = None,
+        ignore_index: Optional[int] = None,
+        return_layouts: bool = False,
+    ):
         root_path = Path(root)
         if not root_path.exists():
             raise FileNotFoundError(f"data_root does not exist: {root}")
         pairs = _discover_pairs(root_path)
-        super().__init__(pairs, image_size)
+        super().__init__(
+            pairs,
+            image_size,
+            num_classes=num_classes,
+            ignore_index=ignore_index,
+            return_layouts=return_layouts,
+        )
 
 
 class LoveDADataset(_SegmentationDataset):
@@ -231,6 +279,8 @@ class LoveDADataset(_SegmentationDataset):
         split: str = "Train",
         domains: Sequence[str] = ("Urban", "Rural"),
         ignore_index: int = 255,
+        num_classes: Optional[int] = None,
+        return_layouts: bool = False,
     ):
         root_path = Path(root)
         if not root_path.exists():
@@ -259,4 +309,11 @@ class LoveDADataset(_SegmentationDataset):
             )
 
         label_remap = lambda array, ignore_index=ignore_index: remap_loveda_labels(array, ignore_index)
-        super().__init__(pairs, image_size, label_remap=label_remap)
+        super().__init__(
+            pairs,
+            image_size,
+            label_remap=label_remap,
+            num_classes=num_classes,
+            ignore_index=ignore_index,
+            return_layouts=return_layouts,
+        )
