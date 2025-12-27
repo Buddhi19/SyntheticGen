@@ -107,6 +107,41 @@ def _discover_pairs(root: Path) -> List[Tuple[Path, Path]]:
     return pairs
 
 
+def _resolve_split_dir(root: Path, split: str) -> Optional[Path]:
+    direct = root / split
+    if direct.is_dir():
+        nested = direct / split
+        if nested.is_dir():
+            return nested
+        return direct
+    for entry in root.iterdir():
+        if entry.is_dir() and entry.name.lower() == split.lower():
+            nested = entry / entry.name
+            if nested.is_dir():
+                return nested
+            return entry
+    return None
+
+
+def _resolve_domain_dir(split_dir: Path, domain: str) -> Optional[Path]:
+    direct = split_dir / domain
+    if direct.is_dir():
+        return direct
+    for entry in split_dir.iterdir():
+        if entry.is_dir() and entry.name.lower() == domain.lower():
+            return entry
+    for entry in split_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        nested = entry / domain
+        if nested.is_dir():
+            return nested
+        for subentry in entry.iterdir():
+            if subentry.is_dir() and subentry.name.lower() == domain.lower():
+                return subentry
+    return None
+
+
 def _load_image(path: Path, image_size: int) -> torch.FloatTensor:
     image = Image.open(path)
     image = ImageOps.exif_transpose(image).convert("RGB")
@@ -242,12 +277,18 @@ class LoveDADataset(_SegmentationDataset):
         layout_size: int = 64,
     ):
         root_path = Path(root)
-        split_dir = root_path / split
+        split_dir = _resolve_split_dir(root_path, split)
+        if split_dir is None:
+            raise FileNotFoundError(f"Could not find split '{split}' under {root}.")
         pairs: List[Tuple[Path, Path]] = []
         for domain in domains:
-            ddir = split_dir / domain
-            if ddir.is_dir():
-                pairs.extend(_discover_pairs(ddir))
+            domain_dir = _resolve_domain_dir(split_dir, domain)
+            if domain_dir is None:
+                continue
+            try:
+                pairs.extend(_discover_pairs(domain_dir))
+            except FileNotFoundError:
+                continue
         if not pairs:
             raise FileNotFoundError("No LoveDA pairs found. Check split/domains structure.")
 
