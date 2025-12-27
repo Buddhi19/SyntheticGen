@@ -15,8 +15,15 @@ from torch.utils.data import DataLoader
 
 from diffusers import DDPMScheduler, UNet2DModel
 
-from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
+try:
+    from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
+except ImportError:  # direct execution
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 
 
 logger = logging.getLogger(__name__)

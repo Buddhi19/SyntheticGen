@@ -34,7 +34,14 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.utils import check_min_version
 
-from .dataset_loveda import load_class_names
+try:
+    from .dataset_loveda import load_class_names
+except ImportError:  # direct execution
+    import sys
+    from pathlib import Path
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.scripts.dataset_loveda import load_class_names
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.

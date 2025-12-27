@@ -25,8 +25,15 @@ from diffusers import DDPMScheduler, UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 
-from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
+try:
+    from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
+except ImportError:  # direct execution
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 
 
 check_min_version("0.36.0")
@@ -55,6 +62,8 @@ def parse_args():
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--loveda_split", type=str, default="Train")
     parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
+    parser.add_argument("--base_channels", type=int, default=64, help="Base channel width for the layout UNet.")
+    parser.add_argument("--layers_per_block", type=int, default=1, help="Number of layers per UNet block.")
     parser.add_argument("--train_batch_size", type=int, default=32)
     parser.add_argument("--num_train_epochs", type=int, default=50)
     parser.add_argument("--max_train_steps", type=int, default=20000)
@@ -228,12 +237,18 @@ def main():
         drop_last=True,
     )
 
+    block_out_channels = (
+        args.base_channels,
+        args.base_channels * 2,
+        args.base_channels * 2,
+        args.base_channels * 2,
+    )
     unet = UNet2DModel(
         sample_size=args.layout_size,
         in_channels=num_classes,
         out_channels=num_classes,
-        layers_per_block=2,
-        block_out_channels=(128, 256, 256, 256),
+        layers_per_block=args.layers_per_block,
+        block_out_channels=block_out_channels,
         down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D"),
         up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"),
         class_embed_type="identity",
@@ -271,6 +286,12 @@ def main():
         unet, ratio_projector, optimizer, train_dataloader, lr_scheduler
     )
 
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
     global_step = 0
     first_epoch = 0
     if args.resume_from_checkpoint:
@@ -287,12 +308,9 @@ def main():
         ratio_projector.train()
         for batch in train_dataloader:
             with accelerator.accumulate(unet):
-                layouts = batch["layout_64"]
-                ratios = batch["ratios"]
-                valid64 = batch["valid_64"]
-                layouts = layouts.to(dtype=torch.float32)
-                ratios = ratios.to(dtype=torch.float32)
-                valid64 = valid64.to(dtype=torch.float32)
+                layouts = batch["layout_64"].to(dtype=weight_dtype)
+                ratios = batch["ratios"].to(dtype=weight_dtype)
+                valid64 = batch["valid_64"].to(dtype=weight_dtype)
                 layouts = layouts * 2.0 - 1.0
 
                 noise = torch.randn_like(layouts)
@@ -312,7 +330,7 @@ def main():
                 weighted = (probs * valid64).sum(dim=(2, 3))
                 denom = valid64.sum(dim=(2, 3)).clamp(min=1.0)
                 r_hat = weighted / denom
-                ratio_loss = F.mse_loss(r_hat, ratios, reduction="mean")
+                ratio_loss = F.mse_loss(r_hat.float(), ratios.float(), reduction="mean")
                 denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
                 loss = denoise_loss + args.lambda_ratio * ratio_loss
 
@@ -385,6 +403,8 @@ def main():
                     "image_size": args.image_size,
                     "ignore_index": args.ignore_index,
                     "num_train_timesteps": args.num_train_timesteps,
+                    "base_channels": args.base_channels,
+                    "layers_per_block": args.layers_per_block,
                 },
                 handle,
                 indent=2,

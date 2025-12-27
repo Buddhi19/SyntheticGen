@@ -88,8 +88,47 @@ class ARG:
         args, extra_args = self.parser.parse_known_args()
         if extra_args and extra_args[0] == "--":
             extra_args = extra_args[1:]
+        extra_args, args = _consume_forwarded_args(extra_args, args)
         args.extra_args = extra_args
         return args
+
+
+def _consume_forwarded_args(extra_args, args: argparse.Namespace):
+    def consume(flag: str):
+        value = None
+        remainder = []
+        idx = 0
+        while idx < len(extra_args):
+            arg = extra_args[idx]
+            if arg == flag:
+                if idx + 1 >= len(extra_args):
+                    raise ValueError(f"{flag} requires a value")
+                value = extra_args[idx + 1]
+                idx += 2
+                continue
+            if arg.startswith(f"{flag}="):
+                value = arg.split("=", 1)[1]
+                idx += 1
+                continue
+            remainder.append(arg)
+            idx += 1
+        return value, remainder
+
+    for flag, attr in (
+        ("--data_root", "data_root"),
+        ("--dataset", "dataset"),
+        ("--layout_output_dir", "layout_output_dir"),
+        ("--controlnet_output_dir", "controlnet_output_dir"),
+        ("--layout_ckpt", "layout_ckpt"),
+        ("--controlnet_ckpt", "controlnet_ckpt"),
+        ("--save_dir", "save_dir"),
+        ("--base_model", "base_model"),
+        ("--gpus", "gpus"),
+    ):
+        value, extra_args = consume(flag)
+        if value is not None:
+            setattr(args, attr, value)
+    return extra_args, args
 
 
 def _flag_present(extra_args, flag: str) -> bool:
@@ -106,13 +145,13 @@ def _append_if_missing(command, extra_args, flag: str, value: str) -> None:
 
 def main() -> None:
     args = ARG().parse()
-    modules = {
-        "train_layout": "src.scripts.train_layout_ddpm",
-        "train_controlnet": "src.scripts.train_controlnet_ratio",
-        "sample": "src.scripts.sample_pair",
+    scripts = {
+        "train_layout": "train_layout_ddpm.py",
+        "train_controlnet": "train_controlnet_ratio.py",
+        "sample": "sample_pair.py",
     }
-    module = modules[args.command]
-    command = [sys.executable, "-m", module, *args.extra_args]
+    script_path = Path(__file__).resolve().parent / scripts[args.command]
+    command = [sys.executable, str(script_path), *args.extra_args]
     if args.command == "train_layout":
         _append_if_missing(command, args.extra_args, "--data_root", args.data_root)
         _append_if_missing(command, args.extra_args, "--dataset", args.dataset)

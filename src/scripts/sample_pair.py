@@ -18,7 +18,13 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel, UNet2DModel
 
-from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+try:
+    from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+except ImportError:  # direct execution
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
 
 
 logger = logging.getLogger(__name__)

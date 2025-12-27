@@ -29,8 +29,15 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
-from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+try:
+    from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+except ImportError:  # direct execution
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
 
 
 check_min_version("0.36.0")

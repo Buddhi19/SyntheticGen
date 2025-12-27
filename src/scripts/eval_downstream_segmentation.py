@@ -16,7 +16,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader
 
-from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+try:
+    from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+except ImportError:  # direct execution
+    import sys
+    from pathlib import Path
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
 
 
 logger = logging.getLogger(__name__)
