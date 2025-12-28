@@ -3,4 +3,5 @@ __pycache__/
 .DS_Store
 .vscode/
 outputs/
+outputsV2/
 outputsimproved/

@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--output_path", type=str, default="outputs/eval_ratio_control.json")
+    parser.add_argument("--output_path", type=str, default="outputsV2/eval_ratio_control.json")
     parser.add_argument("--errors_path", type=str, default=None, help="Optional JSON path for per-sample errors.")
     return parser.parse_args()
 

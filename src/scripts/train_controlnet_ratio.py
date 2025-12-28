@@ -31,7 +31,7 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 try:
-    from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from .dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -41,7 +41,7 @@ except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -65,7 +65,7 @@ def parse_args():
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
-    parser.add_argument("--output_dir", type=str, default="outputs/controlnet_ratio")
+    parser.add_argument("--output_dir", type=str, default="outputsV2/controlnet_ratio")
     parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
     parser.add_argument(
         "--dataset",
@@ -75,13 +75,14 @@ def parse_args():
         help="Dataset type to use.",
     )
     parser.add_argument("--image_size", type=int, default=512, help="Training image size (square).")
+    parser.add_argument("--layout_size", type=int, default=256, help="Coarse layout size used for mask mixing.")
     parser.add_argument("--num_classes", type=int, default=None, help="Number of classes in the dataset.")
     parser.add_argument("--class_names_json", type=str, default=None)
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--loveda_split", type=str, default="Train")
     parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
     parser.add_argument("--prompt", type=str, default="a high-resolution satellite image")
-    parser.add_argument("--train_batch_size", type=int, default=2)
+    parser.add_argument("--train_batch_size", type=int, default=32)
     parser.add_argument("--num_train_epochs", type=int, default=50)
     parser.add_argument("--max_train_steps", type=int, default=20000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -164,6 +165,7 @@ def _resolve_dataset(args, num_classes):
             ignore_index=args.ignore_index,
             num_classes=num_classes,
             return_layouts=True,
+            layout_size=args.layout_size,
         )
     return GenericSegDataset(
         args.data_root,
@@ -171,6 +173,7 @@ def _resolve_dataset(args, num_classes):
         num_classes=num_classes,
         ignore_index=None,
         return_layouts=True,
+        layout_size=args.layout_size,
     )
 
 
@@ -196,13 +199,6 @@ def _get_tb_writer(accelerator: Accelerator):
     if tracker is None:
         return None
     return getattr(tracker, "writer", None)
-
-
-def _build_palette(num_classes: int) -> np.ndarray:
-    rng = np.random.default_rng(0)
-    colors = rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
-    colors[0] = np.array([0, 0, 0], dtype=np.uint8)
-    return colors
 
 
 def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
@@ -485,7 +481,7 @@ def main():
         uncond_embeds = text_encoder(uncond_inputs.input_ids.to(accelerator.device))[0]
     uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
 
-    palette = _build_palette(num_classes)
+    palette = build_palette(class_names, num_classes, dataset=args.dataset)
 
     global_step = 0
     first_epoch = 0
@@ -664,6 +660,7 @@ def main():
                     "dataset": args.dataset,
                     "num_classes": num_classes,
                     "image_size": args.image_size,
+                    "layout_size": args.layout_size,
                     "ignore_index": args.ignore_index,
                     "prompt": args.prompt,
                     "base_model": args.pretrained_model_name_or_path,

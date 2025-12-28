@@ -7,9 +7,9 @@ from pathlib import Path
 main_dir = Path(__file__).resolve().parents[2]
 
 DEFAULT_DATA_ROOT = "/data/inr/llm/Datasets/LOVEDA"
-DEFAULT_LAYOUT_DIR = os.path.join(str(main_dir), "outputs", "layout_ddpm")
-DEFAULT_CONTROLNET_DIR = os.path.join(str(main_dir), "outputs", "controlnet_ratio")
-DEFAULT_SAVE_DIR = os.path.join(str(main_dir), "outputs", "synthetic_pairs")
+DEFAULT_LAYOUT_DIR = os.path.join(str(main_dir), "outputsV2", "layout_ddpm")
+DEFAULT_CONTROLNET_DIR = os.path.join(str(main_dir), "outputsV2", "controlnet_ratio")
+DEFAULT_SAVE_DIR = os.path.join(str(main_dir), "outputsV2", "synthetic_pairs")
 
 
 class ARG:

@@ -27,6 +27,7 @@ from diffusers import (
 )
 
 try:
+    from .dataset_loveda import build_palette
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -38,6 +39,7 @@ except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.scripts.dataset_loveda import build_palette
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -220,6 +222,11 @@ def _save_label_map(label: torch.Tensor, save_path: Path) -> None:
         array = label.astype(np.uint16)
         mode = "I;16"
     Image.fromarray(array, mode=mode).save(save_path)
+
+
+def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
+    labels = label_map.detach().cpu().numpy().astype(np.int64)
+    return palette[labels]
 
 
 def _load_ratio_projector(checkpoint_dir: Path, num_classes: int, embed_dim: int) -> RatioProjector:
@@ -440,6 +447,7 @@ def main():
     if not base_model:
         raise ValueError("base_model is required. Pass --base_model or include it in controlnet training_config.json.")
     prompt = args.prompt or training_config.get("prompt") or "a high-resolution satellite image"
+    palette = build_palette(class_names, num_classes, dataset=training_config.get("dataset"))
 
     tokenizer = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder", torch_dtype=weight_dtype)
@@ -599,15 +607,19 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     image_path = Path(args.save_dir) / "image.png"
     layout_path = Path(args.save_dir) / "layout.png"
+    layout_color_path = Path(args.save_dir) / "layout_color.png"
     metadata_path = Path(args.save_dir) / "metadata.json"
     _save_uint8_rgb(image, image_path)
     _save_label_map(layout_ids_512[0], layout_path)
+    layout_color = _colorize_labels(layout_ids_512[0], palette)
+    Image.fromarray(layout_color, mode="RGB").save(layout_color_path)
 
     metadata = {
         "prompt": prompt,
         "ratios": ratios.tolist(),
         "class_names": class_names,
         "layout_path": str(layout_path),
+        "layout_color_path": str(layout_color_path),
         "image_path": str(image_path),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")

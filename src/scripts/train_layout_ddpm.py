@@ -26,13 +26,13 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 
 try:
-    from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from .dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
     from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
     from src.models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 
 
@@ -54,9 +54,9 @@ def parse_args():
         choices=["loveda", "generic"],
         help="Dataset type to use.",
     )
-    parser.add_argument("--output_dir", type=str, default="outputs/layout_ddpm")
+    parser.add_argument("--output_dir", type=str, default="outputsV2/layout_ddpm")
     parser.add_argument("--image_size", type=int, default=512, help="Dataset image size (square).")
-    parser.add_argument("--layout_size", type=int, default=64, help="Layout diffusion size (square).")
+    parser.add_argument("--layout_size", type=int, default=256, help="Layout diffusion size (square).")
     parser.add_argument("--num_classes", type=int, default=None, help="Number of classes in the dataset.")
     parser.add_argument("--class_names_json", type=str, default=None)
     parser.add_argument("--ignore_index", type=int, default=255)
@@ -144,13 +144,6 @@ def _get_tb_writer(accelerator: Accelerator):
     return getattr(tracker, "writer", None)
 
 
-def _build_palette(num_classes: int) -> np.ndarray:
-    rng = np.random.default_rng(0)
-    colors = rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
-    colors[0] = np.array([0, 0, 0], dtype=np.uint8)
-    return colors
-
-
 def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
     labels = label_map.detach().cpu().numpy().astype(np.int64)
     return palette[labels]
@@ -162,7 +155,7 @@ def _log_layout_sample(
     ratio_projector: RatioProjector,
     noise_scheduler: DDPMScheduler,
     ratios: torch.Tensor,
-    num_classes: int,
+    palette: np.ndarray,
     layout_size: int,
     num_inference_steps: int,
     output_dir: str,
@@ -170,11 +163,10 @@ def _log_layout_sample(
     seed: int,
 ) -> None:
     writer = _get_tb_writer(accelerator)
-    palette = _build_palette(num_classes)
     generator = torch.Generator(device=ratios.device).manual_seed(seed)
     ratio_emb = ratio_projector(ratios.unsqueeze(0))
     layout_latents = torch.randn(
-        (1, num_classes, layout_size, layout_size),
+        (1, palette.shape[0], layout_size, layout_size),
         generator=generator,
         device=ratios.device,
         dtype=ratio_emb.dtype,
@@ -219,6 +211,7 @@ def main():
 
     class_names, num_classes = load_class_names(args.class_names_json, args.num_classes, args.dataset)
     args.num_classes = num_classes
+    palette = build_palette(class_names, num_classes, dataset=args.dataset)
 
     train_dataset = _resolve_dataset(args, num_classes)
 
@@ -368,7 +361,7 @@ def main():
                             ratio_projector=accelerator.unwrap_model(ratio_projector),
                             noise_scheduler=noise_scheduler,
                             ratios=ratios_sample,
-                            num_classes=num_classes,
+                            palette=palette,
                             layout_size=args.layout_size,
                             num_inference_steps=args.sample_num_inference_steps,
                             output_dir=args.output_dir,
