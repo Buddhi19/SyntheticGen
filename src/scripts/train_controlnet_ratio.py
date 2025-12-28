@@ -82,9 +82,9 @@ def parse_args():
     parser.add_argument("--loveda_split", type=str, default="Train")
     parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
     parser.add_argument("--prompt", type=str, default="a high-resolution satellite image")
-    parser.add_argument("--train_batch_size", type=int, default=32)
+    parser.add_argument("--train_batch_size", type=int, default=48)
     parser.add_argument("--num_train_epochs", type=int, default=50)
-    parser.add_argument("--max_train_steps", type=int, default=20000)
+    parser.add_argument("--max_train_steps", type=int, default=40000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--scale_lr", action="store_true")
@@ -147,7 +147,7 @@ def parse_args():
         default=1.0,
         help="Dirichlet concentration for random ratio sampling (smaller -> sparser).",
     )
-    parser.add_argument("--checkpointing_steps", type=int, default=500)
+    parser.add_argument("--checkpointing_steps", type=int, default=1000)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--sample_num_inference_steps", type=int, default=30)
