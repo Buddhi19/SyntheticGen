@@ -271,6 +271,8 @@ def main():
         eps=args.adam_epsilon,
     )
 
+    unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
+
     num_update_steps_per_epoch = math.ceil(len(dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
@@ -282,8 +284,7 @@ def main():
         num_warmup_steps=args.lr_warmup_steps,
         num_training_steps=args.max_train_steps,
     )
-
-    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, dataloader, lr_scheduler)
+    lr_scheduler = accelerator.prepare(lr_scheduler)
 
     weight_dtype = torch.float32
     if accelerator.device.type == "cuda":
