@@ -234,6 +234,8 @@ def _log_controlnet_sample(
                 return_dict=False,
             )
             down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
+            down_samples = tuple(sample.to(dtype=latents.dtype) for sample in down_samples)
+            mid_sample = mid_sample.to(dtype=latents.dtype)
             noise_pred = unet(
                 latents,
                 timestep,
@@ -243,6 +245,7 @@ def _log_controlnet_sample(
                 mid_block_additional_residual=mid_sample,
             ).sample
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
+            latents = latents.to(dtype=prompt_embeds.dtype)
 
     image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
 
