@@ -2,10 +2,11 @@
 
 This repo implements a two-stage pipeline:
 
-- Stage A: a ratio-conditioned layout DDPM that generates a multi-class layout (K channels) at 64x64.
+- Stage A: a ratio-conditioned layout DDPM that generates a multi-class layout (K channels) at 64x64 (or 128/256).
 - Stage B: Stable Diffusion + ControlNet conditioned on the layout, with FiLM-style ratio gating.
 
-The layout generator enforces class ratios during training (explicit ratio loss), and sampling supports optional histogram guidance.
+The layout generator enforces class ratios during training (explicit ratio loss) and can add an optional boundary/edge loss for sharper maps.
+Sampling supports optional histogram guidance, CFG, and a ControlNet conditioning-scale schedule.
 
 ## Setup
 
@@ -55,6 +56,16 @@ Masks should be single-channel label maps (integer class ids) or paletted PNGs.
 
 ## Training
 
+Optional (recommended) Stage 0: train a segmentation teacher (for image-level controllability losses)
+
+```bash
+python src/scripts/eval_downstream_segmentation.py \
+  --real_data_root /path/to/loveda \
+  --dataset loveda \
+  --output_path outputs/teacher_eval.json \
+  --save_ckpt outputs/teacher_segnet.pt
+```
+
 Stage A (layout DDPM):
 
 ```bash
@@ -62,10 +73,23 @@ python src/scripts/train_layout_ddpm.py \
   --data_root /path/to/loveda \
   --dataset loveda \
   --output_dir outputs/layout_ddpm \
+  --layout_size 128 \
   --checkpointing_steps 500 \
   --sample_num_inference_steps 50 \
   --lambda_ratio 1.0 \
+  --lambda_edge 0.25 \
   --ratio_temp 1.0
+```
+
+Optional (recommended) Stage A.5: domain-adapt SD UNet (remote-sensing style)
+
+```bash
+python src/scripts/train_sd_unet_adapter.py \
+  --pretrained_model_name_or_path /path/to/sd-v1-5 \
+  --data_root /path/to/loveda \
+  --dataset loveda \
+  --output_dir outputs/sd_unet_adapter \
+  --unet_trainable_up_blocks 2
 ```
 
 Stage B (ControlNet + FiLM ratio conditioning):
@@ -73,15 +97,23 @@ Stage B (ControlNet + FiLM ratio conditioning):
 ```bash
 python src/scripts/train_controlnet_ratio.py \
   --pretrained_model_name_or_path /path/to/sd-v1-5 \
+  --unet_init outputs/sd_unet_adapter/unet \
   --data_root /path/to/loveda \
   --dataset loveda \
-  --output_dir outputs/controlnet_ratio
+  --output_dir outputs/controlnet_ratio \
+  --teacher_ckpt outputs/teacher_segnet.pt \
+  --lambda_teacher_ce 0.5 \
+  --lambda_teacher_ratio 1.0 \
+  --unet_trainable_up_blocks 2 \
+  --unet_unfreeze_step 5000 \
+  --unet_lr 2e-6
 ```
 
 You can also use the wrapper:
 
 ```bash
 python src/scripts/main.py train_layout -- --data_root /path/to/loveda
+python src/scripts/main.py train_sd_adapter -- --data_root /path/to/loveda --base_model /path/to/sd-v1-5
 python src/scripts/main.py train_controlnet -- --data_root /path/to/loveda --base_model /path/to/sd-v1-5
 ```
 
@@ -94,6 +126,9 @@ python src/scripts/sample_pair.py \
   --layout_ckpt outputs/layout_ddpm \
   --controlnet_ckpt outputs/controlnet_ratio \
   --base_model /path/to/sd-v1-5 \
+  --guidance_scale 5.0 \
+  --controlnet_scale_start 1.0 \
+  --controlnet_scale_end 0.5 \
   --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
   --save_dir outputs/sample_pair
 ```
@@ -129,6 +164,7 @@ python src/scripts/sample_pair.py \
 Notes:
 - `--mask_format` supports `indexed` (0..K-1 with ignore) and `loveda_raw` (0=ignore, 1..K).
 - `--ignore_index` defaults to 255 and is respected when building one-hot layouts.
+- If `outputs/controlnet_ratio/unet` exists (UNet adapter was trained during Stage B), sampling uses it automatically.
 
 ## Evaluation
 

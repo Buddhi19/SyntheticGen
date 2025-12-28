@@ -32,12 +32,14 @@ from diffusers.utils.import_utils import is_xformers_available
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
     from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from ..models.segmentation import SimpleSegNet
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
     from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from src.models.segmentation import SimpleSegNet
 
 
 check_min_version("0.36.0")
@@ -55,6 +57,12 @@ def parse_args():
         type=str,
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--unet_init",
+        type=str,
+        default=None,
+        help="Optional path to a domain-adapted UNet directory (e.g. outputs/sd_unet_adapter/unet).",
     )
     parser.add_argument("--output_dir", type=str, default="outputs/controlnet_ratio")
     parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
@@ -95,6 +103,24 @@ def parse_args():
     parser.add_argument("--checkpointing_steps", type=int, default=500)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--unet_trainable_up_blocks",
+        type=int,
+        default=0,
+        help="Unfreeze final N UNet up-blocks (after --unet_unfreeze_step) to further domain-adapt.",
+    )
+    parser.add_argument("--unet_unfreeze_step", type=int, default=5000, help="Step at which to unfreeze UNet adapter.")
+    parser.add_argument("--unet_lr", type=float, default=2e-6, help="Learning rate for UNet adapter params.")
+    parser.add_argument(
+        "--teacher_ckpt",
+        type=str,
+        default=None,
+        help="Optional segmentation teacher checkpoint (SimpleSegNet) for image-level layout/ratio losses.",
+    )
+    parser.add_argument("--lambda_teacher_ce", type=float, default=0.0, help="Teacher CE loss weight.")
+    parser.add_argument("--lambda_teacher_ratio", type=float, default=0.0, help="Teacher ratio loss weight.")
+    parser.add_argument("--teacher_image_size", type=int, default=256, help="Resolution used for teacher loss.")
+    parser.add_argument("--teacher_loss_every_steps", type=int, default=1, help="Compute teacher loss every N steps.")
     parser.add_argument("--sample_num_inference_steps", type=int, default=30)
     parser.add_argument("--sample_seed", type=int, default=0)
     parser.add_argument("--seed", type=int, default=None)
@@ -145,6 +171,39 @@ def _infer_num_down_residuals(controlnet) -> int:
         layers = getattr(controlnet.config, "layers_per_block", 1)
         return 1 + len(controlnet.config.down_block_types) * int(layers)
     return len(getattr(controlnet, "down_blocks", []))
+
+
+def _select_unet_adapter_params(unet: UNet2DConditionModel, trainable_up_blocks: int):
+    if trainable_up_blocks <= 0:
+        return []
+    if trainable_up_blocks > len(unet.up_blocks):
+        raise ValueError(f"--unet_trainable_up_blocks={trainable_up_blocks} exceeds UNet up_blocks={len(unet.up_blocks)}")
+    modules = list(unet.up_blocks[-trainable_up_blocks:]) + [unet.conv_norm_out, unet.conv_out]
+    params = []
+    seen = set()
+    for module in modules:
+        for param in module.parameters():
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            params.append(param)
+    return params
+
+
+def _load_teacher(ckpt_path: str, num_classes: int, device: torch.device):
+    model = SimpleSegNet(num_classes)
+    state = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(state, dict):
+        if "state_dict" in state:
+            state = state["state_dict"]
+        elif "model" in state:
+            state = state["model"]
+    model.load_state_dict(state)
+    model.to(device=device, dtype=torch.float32)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
 
 
 def _ensure_identity_class_embedding(model):
@@ -211,19 +270,24 @@ def _log_controlnet_sample(
     num_inference_steps: int,
 ) -> None:
     writer = _get_tb_writer(accelerator)
+    sample_dtype = prompt_embeds.dtype
+    prompt_embeds = prompt_embeds.to(dtype=sample_dtype)
+    layouts = layouts.to(dtype=sample_dtype)
+    ratios = ratios.to(dtype=sample_dtype)
+
     generator = torch.Generator(device=layouts.device).manual_seed(seed)
 
-    ratio_emb = ratio_projector(ratios.unsqueeze(0)).to(dtype=prompt_embeds.dtype)
-    latents = torch.randn(
-        (1, unet.config.in_channels, layouts.shape[-1] // 8, layouts.shape[-1] // 8),
-        generator=generator,
-        device=layouts.device,
-        dtype=prompt_embeds.dtype,
-    )
-    latents = latents * scheduler.init_noise_sigma
     scheduler.set_timesteps(num_inference_steps, device=layouts.device)
+    with torch.no_grad(), accelerator.autocast():
+        ratio_emb = ratio_projector(ratios.unsqueeze(0)).to(dtype=sample_dtype)
+        latents = torch.randn(
+            (1, unet.config.in_channels, layouts.shape[-1] // 8, layouts.shape[-1] // 8),
+            generator=generator,
+            device=layouts.device,
+            dtype=sample_dtype,
+        )
+        latents = latents * scheduler.init_noise_sigma
 
-    with torch.no_grad():
         for timestep in scheduler.timesteps:
             down_samples, mid_sample = controlnet(
                 latents,
@@ -244,8 +308,7 @@ def _log_controlnet_sample(
                 down_block_additional_residuals=down_samples,
                 mid_block_additional_residual=mid_sample,
             ).sample
-            latents = scheduler.step(noise_pred, timestep, latents).prev_sample
-            latents = latents.to(dtype=prompt_embeds.dtype)
+            latents = scheduler.step(noise_pred, timestep, latents).prev_sample.to(dtype=sample_dtype)
 
     image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
 
@@ -305,7 +368,8 @@ def main():
         pixel_values = torch.stack([ex["pixel_values"] for ex in examples])
         layouts = torch.stack([ex["layout_512"] for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
-        return {"pixel_values": pixel_values, "layout_512": layouts, "ratios": ratios}
+        labels = torch.stack([ex["labels"] for ex in examples])
+        return {"pixel_values": pixel_values, "layout_512": layouts, "ratios": ratios, "labels": labels}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -320,6 +384,14 @@ def main():
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+    if args.unet_init:
+        init_unet = UNet2DConditionModel.from_pretrained(args.unet_init)
+        missing, unexpected = unet.load_state_dict(init_unet.state_dict(), strict=False)
+        if accelerator.is_main_process:
+            if missing:
+                logger.warning(f"UNet init missing keys: {len(missing)}")
+            if unexpected:
+                logger.warning(f"UNet init unexpected keys: {len(unexpected)}")
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     sample_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
@@ -330,6 +402,9 @@ def main():
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
+    unet_adapter_params = _select_unet_adapter_params(unet, args.unet_trainable_up_blocks)
+    for p in unet_adapter_params:
+        p.requires_grad = False
     unet.eval()
     vae.eval()
     text_encoder.eval()
@@ -349,8 +424,17 @@ def main():
     if args.scale_lr:
         args.learning_rate = args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size
 
+    optimizer_param_groups = [
+        {
+            "params": chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()),
+            "lr": args.learning_rate,
+        }
+    ]
+    if unet_adapter_params:
+        optimizer_param_groups.append({"params": unet_adapter_params, "lr": args.unet_lr})
+
     optimizer = torch.optim.AdamW(
-        chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()),
+        optimizer_param_groups,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -382,7 +466,10 @@ def main():
 
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-    unet.to(accelerator.device, dtype=weight_dtype)
+    if unet_adapter_params:
+        unet.to(accelerator.device, dtype=torch.float32)
+    else:
+        unet.to(accelerator.device, dtype=weight_dtype)
 
     text_inputs = tokenizer(
         [args.prompt],
@@ -396,6 +483,9 @@ def main():
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
 
     palette = _build_palette(num_classes)
+    teacher = None
+    if args.teacher_ckpt and (args.lambda_teacher_ce > 0 or args.lambda_teacher_ratio > 0):
+        teacher = _load_teacher(args.teacher_ckpt, num_classes=num_classes, device=accelerator.device)
 
     global_step = 0
     first_epoch = 0
@@ -407,6 +497,7 @@ def main():
 
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+    unet_adapter_unfrozen = False
 
     for epoch in range(first_epoch, args.num_train_epochs):
         controlnet.train()
@@ -414,9 +505,24 @@ def main():
         film_gate.train()
         for batch in train_dataloader:
             with accelerator.accumulate(controlnet):
+                if unet_adapter_params and (not unet_adapter_unfrozen) and global_step >= args.unet_unfreeze_step:
+                    for p in unet_adapter_params:
+                        p.requires_grad = True
+                    unet_adapter_unfrozen = True
+                    if accelerator.is_main_process:
+                        logger.info(
+                            f"Unfroze UNet adapter params at step {global_step} (up_blocks={args.unet_trainable_up_blocks})."
+                        )
+
+                if unet_adapter_unfrozen:
+                    unet.train()
+                else:
+                    unet.eval()
+
                 pixel_values = batch["pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
                 layouts = batch["layout_512"].to(device=accelerator.device, dtype=weight_dtype)
                 ratios = batch["ratios"].to(device=accelerator.device, dtype=weight_dtype)
+                labels = batch["labels"].to(device=accelerator.device, dtype=torch.long)
 
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample()
@@ -428,36 +534,78 @@ def main():
                 ).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                ratio_emb = ratio_projector(ratios)
-                prompt_batch = prompt_embeds.repeat(latents.shape[0], 1, 1)
+                with accelerator.autocast():
+                    ratio_emb = ratio_projector(ratios)
+                    prompt_batch = prompt_embeds.repeat(latents.shape[0], 1, 1)
 
-                down_samples, mid_sample = controlnet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_batch,
-                    controlnet_cond=layouts,
-                    class_labels=ratio_emb,
-                    return_dict=False,
-                )
-                down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
-                down_samples = tuple(sample.to(dtype=noisy_latents.dtype) for sample in down_samples)
-                mid_sample = mid_sample.to(dtype=noisy_latents.dtype)
+                    down_samples, mid_sample = controlnet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=prompt_batch,
+                        controlnet_cond=layouts,
+                        class_labels=ratio_emb,
+                        return_dict=False,
+                    )
+                    down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
+                    down_samples = tuple(sample.to(dtype=noisy_latents.dtype) for sample in down_samples)
+                    mid_sample = mid_sample.to(dtype=noisy_latents.dtype)
 
-                noise_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_batch,
-                    class_labels=ratio_emb,
-                    down_block_additional_residuals=down_samples,
-                    mid_block_additional_residual=mid_sample,
-                ).sample
+                    noise_pred = unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=prompt_batch,
+                        class_labels=ratio_emb,
+                        down_block_additional_residuals=down_samples,
+                        mid_block_additional_residual=mid_sample,
+                    ).sample
+                denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                teacher_ce = torch.tensor(0.0, device=noise_pred.device)
+                teacher_ratio_loss = torch.tensor(0.0, device=noise_pred.device)
+                teacher_loss = torch.tensor(0.0, device=noise_pred.device)
+                if (
+                    teacher is not None
+                    and args.teacher_loss_every_steps > 0
+                    and global_step % args.teacher_loss_every_steps == 0
+                    and (args.lambda_teacher_ce > 0 or args.lambda_teacher_ratio > 0)
+                ):
+                    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=noisy_latents.device)
+                    a = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                    sqrt_a = a.sqrt()
+                    sqrt_one_minus_a = (1 - a).sqrt()
+                    x0_pred = (noisy_latents - sqrt_one_minus_a * noise_pred) / sqrt_a
+                    image_pred = _vae_decode(vae, x0_pred / vae.config.scaling_factor)
+                    image_pred = image_pred.clamp(-1, 1).to(dtype=torch.float32)
 
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                    tsize = int(args.teacher_image_size)
+                    if tsize > 0 and image_pred.shape[-1] != tsize:
+                        image_small = F.interpolate(image_pred, size=(tsize, tsize), mode="bilinear", align_corners=False)
+                        labels_small = (
+                            F.interpolate(labels.unsqueeze(1).float(), size=(tsize, tsize), mode="nearest")
+                            .squeeze(1)
+                            .long()
+                        )
+                    else:
+                        image_small = image_pred
+                        labels_small = labels
+
+                    teacher_logits = teacher(image_small)
+                    if args.lambda_teacher_ce > 0:
+                        teacher_ce = F.cross_entropy(teacher_logits, labels_small, ignore_index=args.ignore_index)
+                    if args.lambda_teacher_ratio > 0:
+                        valid = (labels_small != args.ignore_index).unsqueeze(1)
+                        probs = torch.softmax(teacher_logits, dim=1)
+                        weighted = (probs * valid.to(dtype=probs.dtype)).sum(dim=(2, 3))
+                        denom = valid.to(dtype=probs.dtype).sum(dim=(2, 3)).clamp(min=1.0)
+                        r_hat = weighted / denom
+                        teacher_ratio_loss = F.mse_loss(r_hat.float(), ratios.float(), reduction="mean")
+                    teacher_loss = args.lambda_teacher_ce * teacher_ce + args.lambda_teacher_ratio * teacher_ratio_loss
+
+                loss = denoise_loss + teacher_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
-                        chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()),
+                        chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters(), unet_adapter_params),
                         args.max_grad_norm,
                     )
                 optimizer.step()
@@ -468,7 +616,17 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 if global_step % args.logging_steps == 0:
-                    accelerator.log({"train_loss": loss.detach().item()}, step=global_step)
+                    accelerator.log(
+                        {
+                            "train_loss": loss.detach().item(),
+                            "denoise_loss": denoise_loss.detach().item(),
+                            "teacher_loss": teacher_loss.detach().item(),
+                            "teacher_ce": teacher_ce.detach().item(),
+                            "teacher_ratio_loss": teacher_ratio_loss.detach().item(),
+                            "unet_adapter_unfrozen": float(unet_adapter_unfrozen),
+                        },
+                        step=global_step,
+                    )
 
                 if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -516,6 +674,8 @@ def main():
         unwrapped_controlnet.save_pretrained(os.path.join(args.output_dir, "controlnet"))
         torch.save(unwrapped_ratio.state_dict(), os.path.join(args.output_dir, "ratio_projector.bin"))
         torch.save(unwrapped_gate.state_dict(), os.path.join(args.output_dir, "film_gate.bin"))
+        if args.unet_trainable_up_blocks > 0:
+            unet.save_pretrained(os.path.join(args.output_dir, "unet"))
         with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as handle:
             json.dump(class_names, handle, indent=2)
         with open(os.path.join(args.output_dir, "training_config.json"), "w", encoding="utf-8") as handle:
@@ -527,6 +687,14 @@ def main():
                     "ignore_index": args.ignore_index,
                     "prompt": args.prompt,
                     "base_model": args.pretrained_model_name_or_path,
+                    "unet_init": args.unet_init,
+                    "unet_trainable_up_blocks": args.unet_trainable_up_blocks,
+                    "unet_unfreeze_step": args.unet_unfreeze_step,
+                    "unet_lr": args.unet_lr,
+                    "teacher_ckpt": args.teacher_ckpt,
+                    "lambda_teacher_ce": args.lambda_teacher_ce,
+                    "lambda_teacher_ratio": args.lambda_teacher_ratio,
+                    "teacher_image_size": args.teacher_image_size,
                 },
                 handle,
                 indent=2,

@@ -9,6 +9,7 @@ main_dir = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_ROOT = "/data/inr/llm/Datasets/LOVEDA"
 DEFAULT_LAYOUT_DIR = os.path.join(str(main_dir), "outputs", "layout_ddpm")
 DEFAULT_CONTROLNET_DIR = os.path.join(str(main_dir), "outputs", "controlnet_ratio")
+DEFAULT_SD_ADAPTER_DIR = os.path.join(str(main_dir), "outputs", "sd_unet_adapter")
 DEFAULT_SAVE_DIR = os.path.join(str(main_dir), "outputs", "synthetic_pairs")
 
 
@@ -20,7 +21,7 @@ class ARG:
     def add_arguments(self) -> None:
         self.parser.add_argument(
             "command",
-            choices=["train_layout", "train_controlnet", "sample"],
+            choices=["train_layout", "train_sd_adapter", "train_controlnet", "sample"],
             help="Which script to run.",
         )
         self.parser.add_argument(
@@ -41,6 +42,12 @@ class ARG:
             type=str,
             default=DEFAULT_LAYOUT_DIR,
             help="Output directory for layout DDPM checkpoints.",
+        )
+        self.parser.add_argument(
+            "--sd_adapter_output_dir",
+            type=str,
+            default=DEFAULT_SD_ADAPTER_DIR,
+            help="Output directory for SD UNet adapter checkpoints.",
         )
         self.parser.add_argument(
             "--controlnet_output_dir",
@@ -131,6 +138,7 @@ def _consume_forwarded_args(extra_args, args: argparse.Namespace):
         ("--data_root", "data_root"),
         ("--dataset", "dataset"),
         ("--layout_output_dir", "layout_output_dir"),
+        ("--sd_adapter_output_dir", "sd_adapter_output_dir"),
         ("--controlnet_output_dir", "controlnet_output_dir"),
         ("--layout_ckpt", "layout_ckpt"),
         ("--controlnet_ckpt", "controlnet_ckpt"),
@@ -165,6 +173,7 @@ def main() -> None:
     args = ARG().parse()
     scripts = {
         "train_layout": "train_layout_ddpm.py",
+        "train_sd_adapter": "train_sd_unet_adapter.py",
         "train_controlnet": "train_controlnet_ratio.py",
         "sample": "sample_pair.py",
     }
@@ -174,6 +183,11 @@ def main() -> None:
         _append_if_missing(command, args.extra_args, "--data_root", args.data_root)
         _append_if_missing(command, args.extra_args, "--dataset", args.dataset)
         _append_if_missing(command, args.extra_args, "--output_dir", args.layout_output_dir)
+    elif args.command == "train_sd_adapter":
+        _append_if_missing(command, args.extra_args, "--data_root", args.data_root)
+        _append_if_missing(command, args.extra_args, "--dataset", args.dataset)
+        _append_if_missing(command, args.extra_args, "--output_dir", args.sd_adapter_output_dir)
+        _append_if_missing(command, args.extra_args, "--pretrained_model_name_or_path", args.base_model)
     elif args.command == "train_controlnet":
         _append_if_missing(command, args.extra_args, "--data_root", args.data_root)
         _append_if_missing(command, args.extra_args, "--dataset", args.dataset)
@@ -192,7 +206,7 @@ def main() -> None:
             raise ValueError("--gpus cannot be empty.")
 
     launcher = args.launcher
-    if launcher is None and args.command in {"train_layout", "train_controlnet"}:
+    if launcher is None and args.command in {"train_layout", "train_sd_adapter", "train_controlnet"}:
         if gpus and len([gpu for gpu in gpus.split(",") if gpu]) > 1:
             launcher = "accelerate"
         else:

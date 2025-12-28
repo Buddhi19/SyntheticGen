@@ -62,6 +62,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_path", type=str, default="outputs/eval_downstream_segmentation.json")
+    parser.add_argument(
+        "--save_ckpt",
+        type=str,
+        default=None,
+        help="Optional path to save the trained real-only segmentation model (state_dict).",
+    )
     return parser.parse_args()
 
 
@@ -114,7 +120,7 @@ def _compute_iou(conf: torch.Tensor) -> Metrics:
     return Metrics(mean_iou=mean_iou, per_class_iou=iou)
 
 
-def _train_and_eval(train_dataset, val_dataset, args) -> Metrics:
+def _train_and_eval(train_dataset, val_dataset, args, save_ckpt_path: Optional[str] = None) -> Metrics:
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA requested but not available. Falling back to CPU.")
@@ -163,6 +169,10 @@ def _train_and_eval(train_dataset, val_dataset, args) -> Metrics:
             _update_confusion(conf, preds, labels, args.num_classes, args.ignore_index)
 
     metrics = _compute_iou(conf)
+    if save_ckpt_path:
+        save_path = Path(save_ckpt_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_path)
     return metrics
 
 
@@ -204,7 +214,7 @@ def main():
         args.ignore_index,
     )
 
-    metrics_real = _train_and_eval(train_real, val_dataset, args)
+    metrics_real = _train_and_eval(train_real, val_dataset, args, save_ckpt_path=args.save_ckpt)
 
     results = {
         "real_only": {

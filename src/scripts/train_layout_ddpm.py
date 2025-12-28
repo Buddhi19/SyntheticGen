@@ -88,6 +88,7 @@ def parse_args():
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--lambda_ratio", type=float, default=1.0)
+    parser.add_argument("--lambda_edge", type=float, default=0.0, help="Edge/boundary loss weight for sharper layouts.")
     parser.add_argument("--ratio_temp", type=float, default=1.0)
     parser.add_argument("--sample_num_inference_steps", type=int, default=50)
     parser.add_argument("--sample_seed", type=int, default=0)
@@ -109,6 +110,20 @@ def parse_args():
         args.local_rank = env_local_rank
 
     return args
+
+
+def _sobel_edge_magnitude(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim != 4:
+        raise ValueError(f"Expected x to have shape [B,C,H,W], got {tuple(x.shape)}")
+    _, channels, _, _ = x.shape
+    kernel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], device=x.device, dtype=x.dtype)
+    kernel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], device=x.device, dtype=x.dtype)
+    kernel_x = kernel_x.view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+    kernel_y = kernel_y.view(1, 1, 3, 3).repeat(channels, 1, 1, 1)
+    grad_x = F.conv2d(x, kernel_x, padding=1, groups=channels)
+    grad_y = F.conv2d(x, kernel_y, padding=1, groups=channels)
+    mag = torch.sqrt(grad_x * grad_x + grad_y * grad_y + 1e-6)
+    return mag.mean(dim=1, keepdim=True)
 
 
 def _resolve_dataset(args, num_classes):
@@ -308,10 +323,10 @@ def main():
         ratio_projector.train()
         for batch in train_dataloader:
             with accelerator.accumulate(unet):
-                layouts = batch["layout_64"].to(dtype=weight_dtype)
+                layouts_gt = batch["layout_64"].to(dtype=weight_dtype)
                 ratios = batch["ratios"].to(dtype=weight_dtype)
                 valid64 = batch["valid_64"].to(dtype=weight_dtype)
-                layouts = layouts * 2.0 - 1.0
+                layouts = layouts_gt * 2.0 - 1.0
 
                 noise = torch.randn_like(layouts)
                 timesteps = torch.randint(
@@ -331,8 +346,15 @@ def main():
                 denom = valid64.sum(dim=(2, 3)).clamp(min=1.0)
                 r_hat = weighted / denom
                 ratio_loss = F.mse_loss(r_hat.float(), ratios.float(), reduction="mean")
+                edge_loss = layouts.new_tensor(0.0)
+                if args.lambda_edge > 0:
+                    edge_pred = _sobel_edge_magnitude(probs)
+                    edge_target = _sobel_edge_magnitude(layouts_gt)
+                    edge_pred = edge_pred * valid64
+                    edge_target = edge_target * valid64
+                    edge_loss = F.l1_loss(edge_pred.float(), edge_target.float(), reduction="mean")
                 denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-                loss = denoise_loss + args.lambda_ratio * ratio_loss
+                loss = denoise_loss + args.lambda_ratio * ratio_loss + args.lambda_edge * edge_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -350,6 +372,7 @@ def main():
                             "train_loss": loss.detach().item(),
                             "denoise_loss": denoise_loss.detach().item(),
                             "ratio_loss": ratio_loss.detach().item(),
+                            "edge_loss": edge_loss.detach().item() if args.lambda_edge > 0 else 0.0,
                         },
                         step=global_step,
                     )
@@ -405,6 +428,9 @@ def main():
                     "num_train_timesteps": args.num_train_timesteps,
                     "base_channels": args.base_channels,
                     "layers_per_block": args.layers_per_block,
+                    "lambda_ratio": args.lambda_ratio,
+                    "lambda_edge": args.lambda_edge,
+                    "ratio_temp": args.ratio_temp,
                 },
                 handle,
                 indent=2,

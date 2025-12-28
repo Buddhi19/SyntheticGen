@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -42,6 +43,8 @@ def parse_args():
     parser.add_argument("--ratios_json", type=str, default=None, help="JSON file with ratios list/dict.")
     parser.add_argument("--class_names_json", type=str, default=None, help="Optional class names JSON.")
     parser.add_argument("--prompt", type=str, default=None, help="Prompt for image sampling.")
+    parser.add_argument("--negative_prompt", type=str, default="", help="Negative prompt for CFG.")
+    parser.add_argument("--guidance_scale", type=float, default=1.0, help="Classifier-free guidance scale.")
     parser.add_argument("--init_image", type=str, default=None, help="Optional init image for img2img editing.")
     parser.add_argument("--init_mask", type=str, default=None, help="Optional init mask (label map) for layout editing.")
     parser.add_argument("--strength_layout", type=float, default=0.8, help="Layout img2img strength (0..1).")
@@ -69,6 +72,13 @@ def parse_args():
     )
     parser.add_argument("--hist_guidance_scale", type=float, default=0.0, help="Histogram guidance scale for layouts.")
     parser.add_argument("--hist_guidance_temp", type=float, default=1.0, help="Softmax temperature for histogram guidance.")
+    parser.add_argument(
+        "--layout_upsample_mode",
+        type=str,
+        default="bilinear_logits",
+        choices=["bilinear_logits", "nearest_onehot"],
+        help="How to upsample Stage-A logits to image_size for ControlNet conditioning.",
+    )
     parser.add_argument("--num_inference_steps_layout", type=int, default=50)
     parser.add_argument("--num_inference_steps_image", type=int, default=30)
     parser.add_argument("--image_size", type=int, default=512)
@@ -76,6 +86,9 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--scheduler", type=str, default="ddim", choices=["ddim", "ddpm"])
+    parser.add_argument("--controlnet_scale_start", type=float, default=1.0, help="ControlNet conditioning scale at early steps.")
+    parser.add_argument("--controlnet_scale_end", type=float, default=0.5, help="ControlNet conditioning scale at late steps.")
+    parser.add_argument("--controlnet_scale_schedule", type=str, default="linear", choices=["linear", "cosine"])
     return parser.parse_args()
 
 
@@ -283,6 +296,15 @@ def _get_strength_timesteps(num_steps: int, strength: float) -> Tuple[int, int]:
     return init_timestep, t_start
 
 
+def _schedule_value(schedule: str, start: float, end: float, frac: float) -> float:
+    frac = min(max(frac, 0.0), 1.0)
+    if schedule == "linear":
+        return start + (end - start) * frac
+    if schedule == "cosine":
+        return end + (start - end) * 0.5 * (1.0 + math.cos(math.pi * frac))
+    raise ValueError(f"Unsupported schedule: {schedule}")
+
+
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
@@ -381,11 +403,25 @@ def main():
             if args.hist_guidance_scale > 0:
                 layout_latents = layout_latents + args.hist_guidance_scale * delta
 
-    layout_ids_64 = layout_latents.argmax(dim=1)
-    layout_onehot_64 = F.one_hot(layout_ids_64, num_classes=num_classes).permute(0, 3, 1, 2).float()
-    layout_onehot_512 = F.interpolate(layout_onehot_64, size=(args.image_size, args.image_size), mode="nearest")
-    layout_ids_512 = F.interpolate(layout_ids_64.unsqueeze(1).float(), size=(args.image_size, args.image_size), mode="nearest")
-    layout_ids_512 = layout_ids_512.squeeze(1).long()
+    layout_logits = layout_latents
+    layout_ids_low = layout_logits.argmax(dim=1)
+    if args.layout_upsample_mode == "bilinear_logits":
+        logits_up = F.interpolate(
+            layout_logits,
+            size=(args.image_size, args.image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        layout_ids_512 = logits_up.argmax(dim=1)
+        layout_onehot_512 = F.one_hot(layout_ids_512, num_classes=num_classes).permute(0, 3, 1, 2).float()
+    else:
+        layout_onehot_low = F.one_hot(layout_ids_low, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        layout_onehot_512 = F.interpolate(layout_onehot_low, size=(args.image_size, args.image_size), mode="nearest")
+        layout_ids_512 = F.interpolate(
+            layout_ids_low.unsqueeze(1).float(),
+            size=(args.image_size, args.image_size),
+            mode="nearest",
+        ).squeeze(1).long()
 
     training_config = _load_json(controlnet_ckpt / "training_config.json") or {}
     base_model = args.base_model or training_config.get("base_model")
@@ -396,7 +432,14 @@ def main():
     tokenizer = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder", torch_dtype=weight_dtype)
     vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae", torch_dtype=weight_dtype)
-    unet = UNet2DConditionModel.from_pretrained(base_model, subfolder="unet", torch_dtype=weight_dtype)
+    unet_dir = controlnet_ckpt / "unet"
+    unet_init = training_config.get("unet_init") if isinstance(training_config, dict) else None
+    if unet_dir.is_dir():
+        unet = UNet2DConditionModel.from_pretrained(unet_dir, torch_dtype=weight_dtype)
+    elif unet_init:
+        unet = UNet2DConditionModel.from_pretrained(unet_init, torch_dtype=weight_dtype)
+    else:
+        unet = UNet2DConditionModel.from_pretrained(base_model, subfolder="unet", torch_dtype=weight_dtype)
     controlnet = ControlNetModel.from_pretrained(controlnet_ckpt / "controlnet", torch_dtype=weight_dtype)
 
     _ensure_identity_class_embedding(unet)
@@ -426,16 +469,27 @@ def main():
     ratio_projector.eval()
     film_gate.eval()
 
-    text_inputs = tokenizer(
+    cond_inputs = tokenizer(
         [prompt],
         padding="max_length",
         truncation=True,
         max_length=tokenizer.model_max_length,
         return_tensors="pt",
     )
+    uncond_inputs = tokenizer(
+        [args.negative_prompt or ""],
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    )
     with torch.no_grad():
-        prompt_embeds = text_encoder(text_inputs.input_ids.to(device))[0]
-    prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
+        cond_embeds = text_encoder(cond_inputs.input_ids.to(device))[0]
+        uncond_embeds = text_encoder(uncond_inputs.input_ids.to(device))[0]
+    cond_embeds = cond_embeds.to(dtype=weight_dtype)
+    uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
+    do_cfg = args.guidance_scale is not None and args.guidance_scale > 1.0
+    prompt_embeds = torch.cat([uncond_embeds, cond_embeds], dim=0) if do_cfg else cond_embeds
 
     ratio_emb = ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
     layout_cond = layout_onehot_512.to(device=device, dtype=weight_dtype)
@@ -470,25 +524,51 @@ def main():
         timesteps = scheduler.timesteps
 
     with torch.no_grad():
-        for timestep in timesteps:
+        num_steps = max(len(timesteps), 1)
+        for step_idx, timestep in enumerate(timesteps):
+            frac = step_idx / (num_steps - 1) if num_steps > 1 else 1.0
+            cond_scale = _schedule_value(
+                args.controlnet_scale_schedule,
+                args.controlnet_scale_start,
+                args.controlnet_scale_end,
+                frac,
+            )
+
+            if do_cfg:
+                latents_in = latents.repeat(2, 1, 1, 1)
+                ratio_emb_in = ratio_emb.repeat(2, 1)
+                layout_in = layout_cond.repeat(2, 1, 1, 1)
+            else:
+                latents_in = latents
+                ratio_emb_in = ratio_emb
+                layout_in = layout_cond
+
             down_samples, mid_sample = controlnet(
-                latents,
+                latents_in,
                 timestep,
                 encoder_hidden_states=prompt_embeds,
-                controlnet_cond=layout_cond,
-                class_labels=ratio_emb,
+                controlnet_cond=layout_in,
+                conditioning_scale=float(cond_scale),
+                class_labels=ratio_emb_in,
                 return_dict=False,
             )
-            down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
+            down_samples, mid_sample = film_gate(ratio_emb_in, down_samples, mid_sample)
+            down_samples = tuple(sample.to(dtype=latents_in.dtype) for sample in down_samples)
+            mid_sample = mid_sample.to(dtype=latents_in.dtype)
 
             noise_pred = unet(
-                latents,
+                latents_in,
                 timestep,
                 encoder_hidden_states=prompt_embeds,
-                class_labels=ratio_emb,
+                class_labels=ratio_emb_in,
                 down_block_additional_residuals=down_samples,
                 mid_block_additional_residual=mid_sample,
             ).sample
+
+            if do_cfg:
+                noise_uncond, noise_text = noise_pred.chunk(2)
+                noise_pred = noise_uncond + args.guidance_scale * (noise_text - noise_uncond)
+
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
     image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
@@ -502,6 +582,11 @@ def main():
 
     metadata = {
         "prompt": prompt,
+        "negative_prompt": args.negative_prompt,
+        "guidance_scale": args.guidance_scale,
+        "controlnet_scale_start": args.controlnet_scale_start,
+        "controlnet_scale_end": args.controlnet_scale_end,
+        "controlnet_scale_schedule": args.controlnet_scale_schedule,
         "ratios": ratios.tolist(),
         "class_names": class_names,
         "layout_path": str(layout_path),
