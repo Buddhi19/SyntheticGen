@@ -24,7 +24,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel
+from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel, UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import check_min_version, is_wandb_available
@@ -129,6 +129,24 @@ def parse_args():
     parser.add_argument("--use_ema", action="store_true", help="Use EMA for ControlNet + ratio modules.")
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--noise_offset", type=float, default=0.0, help="Optional offset noise strength (0 disables).")
+    parser.add_argument(
+        "--layout_ckpt_for_sampling",
+        type=str,
+        default=None,
+        help="Optional path to a trained layout DDPM checkpoint; when set, checkpoint sampling uses random ratios + generated layouts.",
+    )
+    parser.add_argument(
+        "--sample_num_inference_steps_layout",
+        type=int,
+        default=50,
+        help="Number of inference steps for layout DDPM sampling during checkpoint visualization.",
+    )
+    parser.add_argument(
+        "--random_ratio_alpha",
+        type=float,
+        default=1.0,
+        help="Dirichlet concentration for random ratio sampling (smaller -> sparser).",
+    )
     parser.add_argument("--checkpointing_steps", type=int, default=500)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
@@ -204,6 +222,48 @@ def _get_tb_writer(accelerator: Accelerator):
 def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
     labels = label_map.detach().cpu().numpy().astype(np.int64)
     return palette[labels]
+
+
+def _sample_random_ratios_dirichlet(num_classes: int, alpha: float, seed: int, device: torch.device, dtype: torch.dtype):
+    alpha = float(alpha)
+    if not np.isfinite(alpha) or alpha <= 0:
+        raise ValueError("--random_ratio_alpha must be a positive, finite number.")
+    rng = np.random.default_rng(int(seed))
+    ratios = rng.dirichlet(np.full((num_classes,), alpha, dtype=np.float64)).astype(np.float32)
+    return torch.tensor(ratios, device=device, dtype=dtype)
+
+
+def _sample_layout_from_ratios(
+    layout_unet: UNet2DModel,
+    layout_ratio_projector: RatioProjector,
+    layout_scheduler: DDPMScheduler,
+    ratios: torch.Tensor,
+    num_inference_steps: int,
+    seed: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    device = ratios.device
+    generator = torch.Generator(device=device).manual_seed(int(seed))
+    num_classes = int(layout_unet.config.in_channels)
+    layout_size = int(layout_unet.config.sample_size)
+
+    ratio_emb = layout_ratio_projector(ratios.unsqueeze(0)).to(dtype=output_dtype)
+    latents = torch.randn(
+        (1, num_classes, layout_size, layout_size),
+        generator=generator,
+        device=device,
+        dtype=output_dtype,
+    )
+    latents = latents * layout_scheduler.init_noise_sigma
+    layout_scheduler.set_timesteps(int(num_inference_steps), device=device)
+    with torch.no_grad():
+        for timestep in layout_scheduler.timesteps:
+            noise_pred = layout_unet(latents, timestep, class_labels=ratio_emb).sample
+            latents = layout_scheduler.step(noise_pred, timestep, latents).prev_sample
+
+    layout_ids = latents.argmax(dim=1)
+    onehot = F.one_hot(layout_ids.long(), num_classes=num_classes).permute(0, 3, 1, 2).to(dtype=output_dtype)
+    return onehot
 
 
 def _vae_decode(vae: AutoencoderKL, latents: torch.Tensor) -> torch.Tensor:
@@ -483,6 +543,31 @@ def main():
 
     palette = build_palette(class_names, num_classes, dataset=args.dataset)
 
+    layout_sampler = None
+    if args.layout_ckpt_for_sampling:
+        layout_ckpt = Path(args.layout_ckpt_for_sampling)
+        if not layout_ckpt.exists():
+            raise FileNotFoundError(f"Layout checkpoint not found: {layout_ckpt}")
+        layout_unet = UNet2DModel.from_pretrained(layout_ckpt / "layout_unet")
+        if int(layout_unet.config.in_channels) != num_classes:
+            raise ValueError(
+                "layout_unet in_channels mismatch: "
+                f"{layout_unet.config.in_channels} (ckpt) vs {num_classes} (dataset)"
+            )
+        time_embed_dim_layout = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
+        layout_ratio_projector = RatioProjector(num_classes, time_embed_dim_layout)
+        state_path = layout_ckpt / "ratio_projector.bin"
+        if not state_path.is_file():
+            raise FileNotFoundError(f"Layout ratio_projector not found at {state_path}")
+        layout_ratio_projector.load_state_dict(torch.load(state_path, map_location="cpu"))
+        layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
+
+        layout_unet.to(accelerator.device, dtype=weight_dtype)
+        layout_ratio_projector.to(accelerator.device, dtype=weight_dtype)
+        layout_unet.eval()
+        layout_ratio_projector.eval()
+        layout_sampler = (layout_unet, layout_ratio_projector, layout_scheduler)
+
     global_step = 0
     first_epoch = 0
     if args.resume_from_checkpoint:
@@ -606,12 +691,43 @@ def main():
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
-                        layouts_sample = layouts[:1].detach()
-                        ratios_sample = ratios[0].detach()
+                        if layout_sampler is not None:
+                            ratios_sample = _sample_random_ratios_dirichlet(
+                                num_classes=num_classes,
+                                alpha=args.random_ratio_alpha,
+                                seed=args.sample_seed + global_step,
+                                device=accelerator.device,
+                                dtype=weight_dtype,
+                            )
+                            layout_unet, layout_ratio_projector, layout_scheduler = layout_sampler
+                            layouts_sample = _sample_layout_from_ratios(
+                                layout_unet=layout_unet,
+                                layout_ratio_projector=layout_ratio_projector,
+                                layout_scheduler=layout_scheduler,
+                                ratios=ratios_sample,
+                                num_inference_steps=args.sample_num_inference_steps_layout,
+                                seed=args.sample_seed + global_step,
+                                output_dtype=weight_dtype,
+                            )
+                            layouts_sample = F.interpolate(
+                                layouts_sample,
+                                size=(args.image_size, args.image_size),
+                                mode="nearest",
+                            )
+                        else:
+                            layouts_sample = layouts[:1].detach()
+                            ratios_sample = ratios[0].detach()
                         was_training = controlnet.training
                         controlnet.eval()
                         ratio_projector.eval()
                         film_gate.eval()
+                        if args.use_ema:
+                            ema_controlnet.store(controlnet.parameters())
+                            ema_ratio_projector.store(ratio_projector.parameters())
+                            ema_film_gate.store(film_gate.parameters())
+                            ema_controlnet.copy_to(controlnet.parameters())
+                            ema_ratio_projector.copy_to(ratio_projector.parameters())
+                            ema_film_gate.copy_to(film_gate.parameters())
                         _log_controlnet_sample(
                             accelerator=accelerator,
                             controlnet=accelerator.unwrap_model(controlnet),
@@ -629,6 +745,24 @@ def main():
                             palette=palette,
                             num_inference_steps=args.sample_num_inference_steps,
                         )
+                        if layout_sampler is not None:
+                            samples_dir = Path(args.output_dir) / "samples"
+                            samples_dir.mkdir(parents=True, exist_ok=True)
+                            meta_path = samples_dir / f"random_meta_step_{global_step:06d}.json"
+                            meta = {
+                                "prompt": args.prompt,
+                                "ratios": [float(x) for x in ratios_sample.detach().cpu().tolist()],
+                                "class_names": class_names,
+                                "layout_ckpt_for_sampling": args.layout_ckpt_for_sampling,
+                                "seed": int(args.sample_seed + global_step),
+                                "layout_steps": int(args.sample_num_inference_steps_layout),
+                                "image_steps": int(args.sample_num_inference_steps),
+                            }
+                            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                        if args.use_ema:
+                            ema_controlnet.restore(controlnet.parameters())
+                            ema_ratio_projector.restore(ratio_projector.parameters())
+                            ema_film_gate.restore(film_gate.parameters())
                         if was_training:
                             controlnet.train()
                             ratio_projector.train()
