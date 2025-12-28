@@ -26,18 +26,27 @@ from transformers import CLIPTextModel, CLIPTokenizer
 
 from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
+from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-    from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from ..models.ratio_conditioning import (
+        PerChannelResidualFiLMGate,
+        RatioProjector,
+        infer_time_embed_dim_from_config,
+    )
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-    from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from src.models.ratio_conditioning import (
+        PerChannelResidualFiLMGate,
+        RatioProjector,
+        infer_time_embed_dim_from_config,
+    )
 
 
 check_min_version("0.36.0")
@@ -92,6 +101,33 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--dataloader_num_workers", type=int, default=4)
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true")
+    parser.add_argument(
+        "--mask_mix_prob",
+        type=float,
+        default=0.5,
+        help="Probability of using upsampled-from-64 masks instead of true 512 masks.",
+    )
+    parser.add_argument(
+        "--cfg_dropout_prob",
+        type=float,
+        default=0.1,
+        help="Probability to drop text conditioning during training (CFG dropout).",
+    )
+    parser.add_argument(
+        "--cond_dropout_prob",
+        type=float,
+        default=0.05,
+        help="Probability to drop control + ratio conditioning during training.",
+    )
+    parser.add_argument(
+        "--snr_gamma",
+        type=float,
+        default=5.0,
+        help="Min-SNR gamma. Set <=0 to disable.",
+    )
+    parser.add_argument("--use_ema", action="store_true", help="Use EMA for ControlNet + ratio modules.")
+    parser.add_argument("--ema_decay", type=float, default=0.9999)
+    parser.add_argument("--noise_offset", type=float, default=0.0, help="Optional offset noise strength (0 disables).")
     parser.add_argument("--checkpointing_steps", type=int, default=500)
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
@@ -200,7 +236,7 @@ def _log_controlnet_sample(
     vae: AutoencoderKL,
     prompt_embeds: torch.Tensor,
     ratio_projector: RatioProjector,
-    film_gate: ResidualFiLMGate,
+    film_gate: nn.Module,
     scheduler: DDIMScheduler,
     layouts: torch.Tensor,
     ratios: torch.Tensor,
@@ -304,8 +340,9 @@ def main():
     def collate_fn(examples):
         pixel_values = torch.stack([ex["pixel_values"] for ex in examples])
         layouts = torch.stack([ex["layout_512"] for ex in examples])
+        layouts_64 = torch.stack([ex["layout_64"] for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
-        return {"pixel_values": pixel_values, "layout_512": layouts, "ratios": ratios}
+        return {"pixel_values": pixel_values, "layout_512": layouts, "layout_64": layouts_64, "ratios": ratios}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -344,7 +381,44 @@ def main():
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
     ratio_projector = RatioProjector(num_classes, time_embed_dim)
-    film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=_infer_num_down_residuals(controlnet))
+    down_channels = []
+    mid_channels = None
+    if hasattr(controlnet, "controlnet_down_blocks"):
+        down_channels = [int(block.out_channels) for block in controlnet.controlnet_down_blocks]
+    if hasattr(controlnet, "controlnet_mid_block") and hasattr(controlnet.controlnet_mid_block, "out_channels"):
+        mid_channels = int(controlnet.controlnet_mid_block.out_channels)
+    if not down_channels or mid_channels is None:
+        layers = int(getattr(controlnet.config, "layers_per_block", 1))
+        block_out_channels = list(getattr(controlnet.config, "block_out_channels", []))
+        down_block_types = list(getattr(controlnet.config, "down_block_types", []))
+        if not block_out_channels or not down_block_types:
+            raise ValueError("Could not infer ControlNet residual channels for PerChannelResidualFiLMGate.")
+        down_channels = [int(block_out_channels[0])]
+        for idx, out_ch in enumerate(block_out_channels):
+            down_channels.extend([int(out_ch)] * layers)
+            if idx != len(block_out_channels) - 1:
+                down_channels.append(int(out_ch))
+        mid_channels = int(block_out_channels[-1])
+
+    film_gate = PerChannelResidualFiLMGate(
+        time_embed_dim,
+        down_channels=down_channels,
+        mid_channels=mid_channels,
+        init_zero=True,
+    )
+
+    ema_controlnet = None
+    ema_ratio_projector = None
+    ema_film_gate = None
+    if args.use_ema:
+        ema_controlnet = EMAModel(
+            controlnet.parameters(),
+            decay=args.ema_decay,
+            model_cls=ControlNetModel,
+            model_config=controlnet.config,
+        )
+        ema_ratio_projector = EMAModel(ratio_projector.parameters(), decay=args.ema_decay)
+        ema_film_gate = EMAModel(film_gate.parameters(), decay=args.ema_decay)
 
     if args.scale_lr:
         args.learning_rate = args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size
@@ -384,6 +458,11 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
 
+    if args.use_ema:
+        ema_controlnet.to(accelerator.device)
+        ema_ratio_projector.to(accelerator.device)
+        ema_film_gate.to(accelerator.device)
+
     text_inputs = tokenizer(
         [args.prompt],
         padding="max_length",
@@ -394,6 +473,17 @@ def main():
     with torch.no_grad():
         prompt_embeds = text_encoder(text_inputs.input_ids.to(accelerator.device))[0]
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
+
+    uncond_inputs = tokenizer(
+        [""],
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        uncond_embeds = text_encoder(uncond_inputs.input_ids.to(accelerator.device))[0]
+    uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
 
     palette = _build_palette(num_classes)
 
@@ -415,7 +505,12 @@ def main():
         for batch in train_dataloader:
             with accelerator.accumulate(controlnet):
                 pixel_values = batch["pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
-                layouts = batch["layout_512"].to(device=accelerator.device, dtype=weight_dtype)
+                layouts_true = batch["layout_512"].to(device=accelerator.device, dtype=weight_dtype)
+                layouts_64 = batch["layout_64"].to(device=accelerator.device, dtype=weight_dtype)
+                layouts_coarse = F.interpolate(layouts_64, size=(args.image_size, args.image_size), mode="nearest")
+                bsz = layouts_true.shape[0]
+                use_coarse = (torch.rand((bsz,), device=accelerator.device) < args.mask_mix_prob).view(bsz, 1, 1, 1)
+                layouts = torch.where(use_coarse, layouts_coarse, layouts_true)
                 ratios = batch["ratios"].to(device=accelerator.device, dtype=weight_dtype)
 
                 with torch.no_grad():
@@ -423,13 +518,29 @@ def main():
                     latents = latents * vae.config.scaling_factor
 
                 noise = torch.randn_like(latents)
+                if args.noise_offset and args.noise_offset > 0:
+                    noise = noise + args.noise_offset * torch.randn(
+                        (noise.shape[0], noise.shape[1], 1, 1),
+                        device=noise.device,
+                        dtype=noise.dtype,
+                    )
                 timesteps = torch.randint(
                     0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device
                 ).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 ratio_emb = ratio_projector(ratios)
-                prompt_batch = prompt_embeds.repeat(latents.shape[0], 1, 1)
+                prompt_batch = prompt_embeds.repeat(bsz, 1, 1)
+                if args.cfg_dropout_prob and args.cfg_dropout_prob > 0:
+                    drop_txt = torch.rand((bsz,), device=accelerator.device) < args.cfg_dropout_prob
+                    if drop_txt.any():
+                        prompt_batch[drop_txt] = uncond_embeds.expand(int(drop_txt.sum().item()), -1, -1)
+
+                if args.cond_dropout_prob and args.cond_dropout_prob > 0:
+                    drop_cond = torch.rand((bsz,), device=accelerator.device) < args.cond_dropout_prob
+                    if drop_cond.any():
+                        layouts[drop_cond] = 0.0
+                        ratio_emb[drop_cond] = 0.0
 
                 down_samples, mid_sample = controlnet(
                     noisy_latents,
@@ -443,6 +554,13 @@ def main():
                 down_samples = tuple(sample.to(dtype=noisy_latents.dtype) for sample in down_samples)
                 mid_sample = mid_sample.to(dtype=noisy_latents.dtype)
 
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
                 noise_pred = unet(
                     noisy_latents,
                     timesteps,
@@ -452,7 +570,21 @@ def main():
                     mid_block_additional_residual=mid_sample,
                 ).sample
 
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                if args.snr_gamma and args.snr_gamma > 0:
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                        dim=1
+                    )[0]
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        mse_loss_weights = mse_loss_weights / snr
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        mse_loss_weights = mse_loss_weights / (snr + 1)
+
+                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    loss = loss.mean()
+                else:
+                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -465,6 +597,10 @@ def main():
                 optimizer.zero_grad()
 
             if accelerator.sync_gradients:
+                if args.use_ema:
+                    ema_controlnet.step(controlnet.parameters())
+                    ema_ratio_projector.step(ratio_projector.parameters())
+                    ema_film_gate.step(film_gate.parameters())
                 progress_bar.update(1)
                 global_step += 1
                 if global_step % args.logging_steps == 0:
@@ -509,6 +645,10 @@ def main():
             break
 
     accelerator.wait_for_everyone()
+    if args.use_ema:
+        ema_controlnet.copy_to(controlnet.parameters())
+        ema_ratio_projector.copy_to(ratio_projector.parameters())
+        ema_film_gate.copy_to(film_gate.parameters())
     if accelerator.is_main_process:
         unwrapped_controlnet = accelerator.unwrap_model(controlnet)
         unwrapped_ratio = accelerator.unwrap_model(ratio_projector)
@@ -527,6 +667,13 @@ def main():
                     "ignore_index": args.ignore_index,
                     "prompt": args.prompt,
                     "base_model": args.pretrained_model_name_or_path,
+                    "mask_mix_prob": args.mask_mix_prob,
+                    "cfg_dropout_prob": args.cfg_dropout_prob,
+                    "cond_dropout_prob": args.cond_dropout_prob,
+                    "snr_gamma": args.snr_gamma,
+                    "noise_offset": args.noise_offset,
+                    "use_ema": args.use_ema,
+                    "ema_decay": args.ema_decay,
                 },
                 handle,
                 indent=2,

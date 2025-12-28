@@ -16,16 +16,34 @@ import torch.nn.functional as F
 from PIL import Image, ImageOps
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel, UNet2DModel
+from diffusers import (
+    AutoencoderKL,
+    ControlNetModel,
+    DDIMScheduler,
+    DDPMScheduler,
+    DPMSolverMultistepScheduler,
+    UNet2DConditionModel,
+    UNet2DModel,
+)
 
 try:
-    from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from ..models.ratio_conditioning import (
+        PerChannelResidualFiLMGate,
+        RatioProjector,
+        ResidualFiLMGate,
+        infer_time_embed_dim_from_config,
+    )
     from ..models.segmentation import SimpleSegNet
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from src.models.ratio_conditioning import (
+        PerChannelResidualFiLMGate,
+        RatioProjector,
+        ResidualFiLMGate,
+        infer_time_embed_dim_from_config,
+    )
     from src.models.segmentation import SimpleSegNet
 
 
@@ -69,13 +87,35 @@ def parse_args():
     )
     parser.add_argument("--hist_guidance_scale", type=float, default=0.0, help="Histogram guidance scale for layouts.")
     parser.add_argument("--hist_guidance_temp", type=float, default=1.0, help="Softmax temperature for histogram guidance.")
+    parser.add_argument("--guidance_scale", type=float, default=5.0)
+    parser.add_argument(
+        "--guidance_rescale",
+        type=float,
+        default=0.0,
+        help="Optional CFG rescale to reduce overexposure/artifacts.",
+    )
+    parser.add_argument("--use_karras_sigmas", action="store_true")
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        default="dpmpp_2m",
+        choices=["ddim", "ddpm", "dpmpp_2m"],
+        help="Image sampler for the second-stage diffusion model.",
+    )
+    parser.add_argument(
+        "--scheduler",
+        dest="sampler",
+        type=str,
+        default=argparse.SUPPRESS,
+        choices=["ddim", "ddpm", "dpmpp_2m"],
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--num_inference_steps_layout", type=int, default=50)
     parser.add_argument("--num_inference_steps_image", type=int, default=30)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--scheduler", type=str, default="ddim", choices=["ddim", "ddpm"])
     return parser.parse_args()
 
 
@@ -87,6 +127,14 @@ def resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
     if dtype == "bf16":
         return torch.bfloat16
     return torch.float32
+
+
+def rescale_noise_cfg(noise_cfg: torch.Tensor, noise_pred_text: torch.Tensor, guidance_rescale: float = 0.0) -> torch.Tensor:
+    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+    return noise_cfg
 
 
 def _load_json(path: Path) -> Optional[Dict]:
@@ -404,13 +452,32 @@ def main():
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
     ratio_projector = _load_ratio_projector(controlnet_ckpt, num_classes, time_embed_dim)
-    film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=_infer_num_down_residuals(controlnet))
-    film_gate.load_state_dict(torch.load(controlnet_ckpt / "film_gate.bin", map_location="cpu"))
-
-    if args.scheduler == "ddim":
-        scheduler = DDIMScheduler.from_pretrained(base_model, subfolder="scheduler")
+    gate_state = torch.load(controlnet_ckpt / "film_gate.bin", map_location="cpu")
+    if isinstance(gate_state, dict) and "proj.weight" in gate_state:
+        film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=_infer_num_down_residuals(controlnet))
+    elif isinstance(gate_state, dict) and any(str(k).startswith("down_mlps.") for k in gate_state.keys()):
+        down_channels = [int(block.out_channels) for block in controlnet.controlnet_down_blocks]
+        mid_channels = int(controlnet.controlnet_mid_block.out_channels)
+        film_gate = PerChannelResidualFiLMGate(
+            time_embed_dim,
+            down_channels=down_channels,
+            mid_channels=mid_channels,
+            init_zero=False,
+        )
     else:
+        raise ValueError(f"Unrecognized FiLM gate checkpoint format: {controlnet_ckpt / 'film_gate.bin'}")
+    film_gate.load_state_dict(gate_state)
+
+    if args.sampler == "dpmpp_2m":
+        scheduler = DPMSolverMultistepScheduler.from_pretrained(
+            base_model,
+            subfolder="scheduler",
+            use_karras_sigmas=args.use_karras_sigmas,
+        )
+    elif args.sampler == "ddpm":
         scheduler = DDPMScheduler.from_pretrained(base_model, subfolder="scheduler")
+    else:
+        scheduler = DDIMScheduler.from_pretrained(base_model, subfolder="scheduler")
 
     text_encoder.to(device, dtype=weight_dtype)
     vae.to(device, dtype=weight_dtype)
@@ -437,8 +504,21 @@ def main():
         prompt_embeds = text_encoder(text_inputs.input_ids.to(device))[0]
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
 
+    uncond_inputs = tokenizer(
+        [""],
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        uncond_embeds = text_encoder(uncond_inputs.input_ids.to(device))[0]
+    uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
+
     ratio_emb = ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
     layout_cond = layout_onehot_512.to(device=device, dtype=weight_dtype)
+    layout_uncond = torch.zeros_like(layout_cond)
+    ratio_uncond = torch.zeros_like(ratio_emb)
     scheduler.set_timesteps(args.num_inference_steps_image, device=device)
     if args.init_image:
         if init_image_tensor is None:
@@ -469,26 +549,49 @@ def main():
         latents = latents * scheduler.init_noise_sigma
         timesteps = scheduler.timesteps
 
+    do_cfg = args.guidance_scale is not None and float(args.guidance_scale) != 1.0
     with torch.no_grad():
         for timestep in timesteps:
+            if do_cfg:
+                latent_model_input = torch.cat([latents] * 2, dim=0)
+                encoder_hidden_states = torch.cat([uncond_embeds, prompt_embeds], dim=0)
+                controlnet_cond = torch.cat([layout_uncond, layout_cond], dim=0)
+                class_labels = torch.cat([ratio_uncond, ratio_emb], dim=0)
+            else:
+                latent_model_input = latents
+                encoder_hidden_states = prompt_embeds
+                controlnet_cond = layout_cond
+                class_labels = ratio_emb
+
+            if hasattr(scheduler, "scale_model_input"):
+                latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
+
             down_samples, mid_sample = controlnet(
-                latents,
+                latent_model_input,
                 timestep,
-                encoder_hidden_states=prompt_embeds,
-                controlnet_cond=layout_cond,
-                class_labels=ratio_emb,
+                encoder_hidden_states=encoder_hidden_states,
+                controlnet_cond=controlnet_cond,
+                class_labels=class_labels,
                 return_dict=False,
             )
-            down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
+            down_samples, mid_sample = film_gate(class_labels, down_samples, mid_sample)
 
             noise_pred = unet(
-                latents,
+                latent_model_input,
                 timestep,
-                encoder_hidden_states=prompt_embeds,
-                class_labels=ratio_emb,
+                encoder_hidden_states=encoder_hidden_states,
+                class_labels=class_labels,
                 down_block_additional_residuals=down_samples,
                 mid_block_additional_residual=mid_sample,
             ).sample
+
+            if do_cfg:
+                noise_uncond, noise_text = noise_pred.chunk(2)
+                noise_cfg = noise_uncond + float(args.guidance_scale) * (noise_text - noise_uncond)
+                if args.guidance_rescale and args.guidance_rescale > 0:
+                    noise_cfg = rescale_noise_cfg(noise_cfg, noise_text, guidance_rescale=float(args.guidance_rescale))
+                noise_pred = noise_cfg
+
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
     image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
