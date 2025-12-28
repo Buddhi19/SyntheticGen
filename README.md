@@ -56,16 +56,6 @@ Masks should be single-channel label maps (integer class ids) or paletted PNGs.
 
 ## Training
 
-Optional (recommended) Stage 0: train a segmentation teacher (for image-level controllability losses)
-
-```bash
-python src/scripts/eval_downstream_segmentation.py \
-  --real_data_root /path/to/loveda \
-  --dataset loveda \
-  --output_path outputs/teacher_eval.json \
-  --save_ckpt outputs/teacher_segnet.pt
-```
-
 Stage A (layout DDPM):
 
 ```bash
@@ -101,9 +91,6 @@ python src/scripts/train_controlnet_ratio.py \
   --data_root /path/to/loveda \
   --dataset loveda \
   --output_dir outputsimproved/controlnet_ratio \
-  --teacher_ckpt outputsimproved/teacher_segnet.pt \
-  --lambda_teacher_ce 0.5 \
-  --lambda_teacher_ratio 1.0 \
   --unet_trainable_up_blocks 2 \
   --unet_unfreeze_step 5000 \
   --unet_lr 2e-6

@@ -32,14 +32,12 @@ from diffusers.utils.import_utils import is_xformers_available
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
     from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
-    from ..models.segmentation import SimpleSegNet
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
     from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
-    from src.models.segmentation import SimpleSegNet
 
 
 check_min_version("0.36.0")
@@ -112,16 +110,6 @@ def parse_args():
     )
     parser.add_argument("--unet_unfreeze_step", type=int, default=5000, help="Step at which to unfreeze UNet adapter.")
     parser.add_argument("--unet_lr", type=float, default=2e-6, help="Learning rate for UNet adapter params.")
-    parser.add_argument(
-        "--teacher_ckpt",
-        type=str,
-        default=None,
-        help="Optional segmentation teacher checkpoint (SimpleSegNet) for image-level layout/ratio losses.",
-    )
-    parser.add_argument("--lambda_teacher_ce", type=float, default=0.0, help="Teacher CE loss weight.")
-    parser.add_argument("--lambda_teacher_ratio", type=float, default=0.0, help="Teacher ratio loss weight.")
-    parser.add_argument("--teacher_image_size", type=int, default=256, help="Resolution used for teacher loss.")
-    parser.add_argument("--teacher_loss_every_steps", type=int, default=1, help="Compute teacher loss every N steps.")
     parser.add_argument("--sample_num_inference_steps", type=int, default=30)
     parser.add_argument("--sample_seed", type=int, default=0)
     parser.add_argument("--seed", type=int, default=None)
@@ -189,22 +177,6 @@ def _select_unet_adapter_params(unet: UNet2DConditionModel, trainable_up_blocks:
             seen.add(id(param))
             params.append(param)
     return params
-
-
-def _load_teacher(ckpt_path: str, num_classes: int, device: torch.device):
-    model = SimpleSegNet(num_classes)
-    state = torch.load(ckpt_path, map_location="cpu")
-    if isinstance(state, dict):
-        if "state_dict" in state:
-            state = state["state_dict"]
-        elif "model" in state:
-            state = state["model"]
-    model.load_state_dict(state)
-    model.to(device=device, dtype=torch.float32)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-    return model
 
 
 def _ensure_identity_class_embedding(model):
@@ -369,8 +341,7 @@ def main():
         pixel_values = torch.stack([ex["pixel_values"] for ex in examples])
         layouts = torch.stack([ex["layout_512"] for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
-        labels = torch.stack([ex["labels"] for ex in examples])
-        return {"pixel_values": pixel_values, "layout_512": layouts, "ratios": ratios, "labels": labels}
+        return {"pixel_values": pixel_values, "layout_512": layouts, "ratios": ratios}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -484,9 +455,6 @@ def main():
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
 
     palette = _build_palette(num_classes)
-    teacher = None
-    if args.teacher_ckpt and (args.lambda_teacher_ce > 0 or args.lambda_teacher_ratio > 0):
-        teacher = _load_teacher(args.teacher_ckpt, num_classes=num_classes, device=accelerator.device)
 
     global_step = 0
     first_epoch = 0
@@ -523,7 +491,6 @@ def main():
                 pixel_values = batch["pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
                 layouts = batch["layout_512"].to(device=accelerator.device, dtype=weight_dtype)
                 ratios = batch["ratios"].to(device=accelerator.device, dtype=weight_dtype)
-                labels = batch["labels"].to(device=accelerator.device, dtype=torch.long)
 
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample()
@@ -560,48 +527,7 @@ def main():
                         mid_block_additional_residual=mid_sample,
                     ).sample
                 denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-                teacher_ce = torch.tensor(0.0, device=noise_pred.device)
-                teacher_ratio_loss = torch.tensor(0.0, device=noise_pred.device)
-                teacher_loss = torch.tensor(0.0, device=noise_pred.device)
-                if (
-                    teacher is not None
-                    and args.teacher_loss_every_steps > 0
-                    and global_step % args.teacher_loss_every_steps == 0
-                    and (args.lambda_teacher_ce > 0 or args.lambda_teacher_ratio > 0)
-                ):
-                    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=noisy_latents.device)
-                    a = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
-                    sqrt_a = a.sqrt()
-                    sqrt_one_minus_a = (1 - a).sqrt()
-                    x0_pred = (noisy_latents - sqrt_one_minus_a * noise_pred) / sqrt_a
-                    image_pred = _vae_decode(vae, x0_pred / vae.config.scaling_factor)
-                    image_pred = image_pred.clamp(-1, 1).to(dtype=torch.float32)
-
-                    tsize = int(args.teacher_image_size)
-                    if tsize > 0 and image_pred.shape[-1] != tsize:
-                        image_small = F.interpolate(image_pred, size=(tsize, tsize), mode="bilinear", align_corners=False)
-                        labels_small = (
-                            F.interpolate(labels.unsqueeze(1).float(), size=(tsize, tsize), mode="nearest")
-                            .squeeze(1)
-                            .long()
-                        )
-                    else:
-                        image_small = image_pred
-                        labels_small = labels
-
-                    teacher_logits = teacher(image_small)
-                    if args.lambda_teacher_ce > 0:
-                        teacher_ce = F.cross_entropy(teacher_logits, labels_small, ignore_index=args.ignore_index)
-                    if args.lambda_teacher_ratio > 0:
-                        valid = (labels_small != args.ignore_index).unsqueeze(1)
-                        probs = torch.softmax(teacher_logits, dim=1)
-                        weighted = (probs * valid.to(dtype=probs.dtype)).sum(dim=(2, 3))
-                        denom = valid.to(dtype=probs.dtype).sum(dim=(2, 3)).clamp(min=1.0)
-                        r_hat = weighted / denom
-                        teacher_ratio_loss = F.mse_loss(r_hat.float(), ratios.float(), reduction="mean")
-                    teacher_loss = args.lambda_teacher_ce * teacher_ce + args.lambda_teacher_ratio * teacher_ratio_loss
-
-                loss = denoise_loss + teacher_loss
+                loss = denoise_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -621,9 +547,6 @@ def main():
                         {
                             "train_loss": loss.detach().item(),
                             "denoise_loss": denoise_loss.detach().item(),
-                            "teacher_loss": teacher_loss.detach().item(),
-                            "teacher_ce": teacher_ce.detach().item(),
-                            "teacher_ratio_loss": teacher_ratio_loss.detach().item(),
                             "unet_adapter_unfrozen": float(unet_adapter_unfrozen),
                         },
                         step=global_step,
@@ -692,10 +615,6 @@ def main():
                     "unet_trainable_up_blocks": args.unet_trainable_up_blocks,
                     "unet_unfreeze_step": args.unet_unfreeze_step,
                     "unet_lr": args.unet_lr,
-                    "teacher_ckpt": args.teacher_ckpt,
-                    "lambda_teacher_ce": args.lambda_teacher_ce,
-                    "lambda_teacher_ratio": args.lambda_teacher_ratio,
-                    "teacher_image_size": args.teacher_image_size,
                 },
                 handle,
                 indent=2,
