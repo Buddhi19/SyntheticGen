@@ -138,6 +138,15 @@ def _resolve_dataset(args, num_classes):
     )
 
 
+def _infer_num_down_residuals(controlnet) -> int:
+    if hasattr(controlnet, "controlnet_down_blocks"):
+        return len(controlnet.controlnet_down_blocks)
+    if hasattr(controlnet, "config") and hasattr(controlnet.config, "down_block_types"):
+        layers = getattr(controlnet.config, "layers_per_block", 1)
+        return 1 + len(controlnet.config.down_block_types) * int(layers)
+    return len(getattr(controlnet, "down_blocks", []))
+
+
 def _ensure_identity_class_embedding(model):
     model.register_to_config(class_embed_type="identity", num_class_embeds=None, projection_class_embeddings_input_dim=None)
     model.class_embedding = nn.Identity()
@@ -258,12 +267,24 @@ def main():
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
     log_with = None if args.report_to == "none" else args.report_to
+    if not torch.cuda.is_available() and args.mixed_precision != "no":
+        logger.warning("CUDA not available. Disabling mixed precision for CPU training.")
+        args.mixed_precision = "no"
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=log_with,
         project_config=accelerator_project_config,
     )
+    if accelerator.device.type == "cpu" and args.mixed_precision != "no":
+        logger.warning("CPU device detected. Forcing mixed_precision=no to avoid CPU fp16 issues.")
+        args.mixed_precision = "no"
+        accelerator = Accelerator(
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            mixed_precision=args.mixed_precision,
+            log_with=log_with,
+            project_config=accelerator_project_config,
+        )
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -320,7 +341,7 @@ def main():
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
     ratio_projector = RatioProjector(num_classes, time_embed_dim)
-    film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=len(controlnet.down_blocks))
+    film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=_infer_num_down_residuals(controlnet))
 
     if args.scale_lr:
         args.learning_rate = args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size
@@ -350,10 +371,11 @@ def main():
     )
 
     weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
+    if accelerator.device.type == "cuda":
+        if accelerator.mixed_precision == "fp16":
+            weight_dtype = torch.float16
+        elif accelerator.mixed_precision == "bf16":
+            weight_dtype = torch.bfloat16
 
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -389,9 +411,9 @@ def main():
         film_gate.train()
         for batch in train_dataloader:
             with accelerator.accumulate(controlnet):
-                pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
-                layouts = batch["layout_512"].to(dtype=weight_dtype)
-                ratios = batch["ratios"].to(dtype=weight_dtype)
+                pixel_values = batch["pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
+                layouts = batch["layout_512"].to(device=accelerator.device, dtype=weight_dtype)
+                ratios = batch["ratios"].to(device=accelerator.device, dtype=weight_dtype)
 
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample()
@@ -415,6 +437,8 @@ def main():
                     return_dict=False,
                 )
                 down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
+                down_samples = tuple(sample.to(dtype=noisy_latents.dtype) for sample in down_samples)
+                mid_sample = mid_sample.to(dtype=noisy_latents.dtype)
 
                 noise_pred = unet(
                     noisy_latents,

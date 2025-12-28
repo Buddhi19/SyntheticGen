@@ -183,6 +183,15 @@ def _load_ratio_projector(checkpoint_dir: Path, num_classes: int, embed_dim: int
     return projector
 
 
+def _infer_num_down_residuals(controlnet) -> int:
+    if hasattr(controlnet, "controlnet_down_blocks"):
+        return len(controlnet.controlnet_down_blocks)
+    if hasattr(controlnet, "config") and hasattr(controlnet.config, "down_block_types"):
+        layers = getattr(controlnet.config, "layers_per_block", 1)
+        return 1 + len(controlnet.config.down_block_types) * int(layers)
+    return len(getattr(controlnet, "down_blocks", []))
+
+
 def _ensure_identity_class_embedding(model) -> None:
     model.register_to_config(class_embed_type="identity", num_class_embeds=None, projection_class_embeddings_input_dim=None)
     model.class_embedding = torch.nn.Identity()
@@ -395,7 +404,7 @@ def main():
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
     ratio_projector = _load_ratio_projector(controlnet_ckpt, num_classes, time_embed_dim)
-    film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=len(controlnet.down_blocks))
+    film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=_infer_num_down_residuals(controlnet))
     film_gate.load_state_dict(torch.load(controlnet_ckpt / "film_gate.bin", map_location="cpu"))
 
     if args.scheduler == "ddim":
