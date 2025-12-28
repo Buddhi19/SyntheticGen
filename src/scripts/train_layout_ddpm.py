@@ -10,6 +10,7 @@ import math
 import os
 from itertools import chain
 from pathlib import Path
+from typing import List
 
 import accelerate
 import numpy as np
@@ -27,12 +28,14 @@ from diffusers.utils import check_min_version, is_wandb_available
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from ..models.label_palette import build_palette
     from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.models.label_palette import build_palette
     from src.models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 
 
@@ -160,11 +163,8 @@ def _get_tb_writer(accelerator: Accelerator):
     return getattr(tracker, "writer", None)
 
 
-def _build_palette(num_classes: int) -> np.ndarray:
-    rng = np.random.default_rng(0)
-    colors = rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
-    colors[0] = np.array([0, 0, 0], dtype=np.uint8)
-    return colors
+def _build_palette(num_classes: int, dataset: str, class_names: List[str]) -> np.ndarray:
+    return build_palette(num_classes, dataset=dataset, class_names=class_names)
 
 
 def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
@@ -179,6 +179,8 @@ def _log_layout_sample(
     noise_scheduler: DDPMScheduler,
     ratios: torch.Tensor,
     num_classes: int,
+    dataset: str,
+    class_names: List[str],
     layout_size: int,
     num_inference_steps: int,
     output_dir: str,
@@ -186,7 +188,7 @@ def _log_layout_sample(
     seed: int,
 ) -> None:
     writer = _get_tb_writer(accelerator)
-    palette = _build_palette(num_classes)
+    palette = _build_palette(num_classes, dataset=dataset, class_names=class_names)
     generator = torch.Generator(device=ratios.device).manual_seed(seed)
     ratio_emb = ratio_projector(ratios.unsqueeze(0))
     layout_latents = torch.randn(
@@ -393,6 +395,8 @@ def main():
                             noise_scheduler=noise_scheduler,
                             ratios=ratios_sample,
                             num_classes=num_classes,
+                            dataset=args.dataset,
+                            class_names=class_names,
                             layout_size=args.layout_size,
                             num_inference_steps=args.sample_num_inference_steps,
                             output_dir=args.output_dir,

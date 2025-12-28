@@ -31,12 +31,14 @@ from diffusers.utils.import_utils import is_xformers_available
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from ..models.label_palette import build_palette
     from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.models.label_palette import build_palette
     from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
 
 
@@ -194,11 +196,8 @@ def _get_tb_writer(accelerator: Accelerator):
     return getattr(tracker, "writer", None)
 
 
-def _build_palette(num_classes: int) -> np.ndarray:
-    rng = np.random.default_rng(0)
-    colors = rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
-    colors[0] = np.array([0, 0, 0], dtype=np.uint8)
-    return colors
+def _build_palette(num_classes: int, *, dataset: str, class_names) -> np.ndarray:
+    return build_palette(num_classes, dataset=dataset, class_names=class_names)
 
 
 def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
@@ -454,7 +453,7 @@ def main():
         prompt_embeds = text_encoder(text_inputs.input_ids.to(accelerator.device))[0]
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
 
-    palette = _build_palette(num_classes)
+    palette = _build_palette(num_classes, dataset=args.dataset, class_names=class_names)
 
     global_step = 0
     first_epoch = 0

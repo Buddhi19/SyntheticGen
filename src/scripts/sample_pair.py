@@ -20,12 +20,14 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel, UNet2DModel
 
 try:
+    from ..models.label_palette import build_palette
     from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
     from ..models.segmentation import SimpleSegNet
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.models.label_palette import build_palette
     from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
     from src.models.segmentation import SimpleSegNet
 
@@ -124,6 +126,13 @@ def _load_class_names(args, layout_ckpt: Path, controlnet_ckpt: Path, num_classe
 
 
 def _parse_ratios(ratios_str: Optional[str], ratios_json: Optional[str], num_classes: int, class_names: List[str]) -> torch.Tensor:
+    class_name_to_idx = {str(name): idx for idx, name in enumerate(class_names)}
+    class_name_to_idx.update({str(name).strip().lower(): idx for idx, name in enumerate(class_names)})
+    if "agriculture" in class_name_to_idx and "agricultural" not in class_name_to_idx:
+        class_name_to_idx["agricultural"] = class_name_to_idx["agriculture"]
+    if "agricultural" in class_name_to_idx and "agriculture" not in class_name_to_idx:
+        class_name_to_idx["agriculture"] = class_name_to_idx["agricultural"]
+
     if ratios_json:
         data = _load_json(Path(ratios_json))
         if isinstance(data, list):
@@ -131,7 +140,8 @@ def _parse_ratios(ratios_str: Optional[str], ratios_json: Optional[str], num_cla
         elif isinstance(data, dict):
             values = [0.0] * num_classes
             for key, value in data.items():
-                idx = int(key) if str(key).isdigit() else class_names.index(key)
+                key_str = str(key).strip()
+                idx = int(key_str) if key_str.isdigit() else class_name_to_idx[key_str.strip().lower()]
                 values[idx] = float(value)
         else:
             raise ValueError("ratios_json must be a list or dict.")
@@ -141,7 +151,7 @@ def _parse_ratios(ratios_str: Optional[str], ratios_json: Optional[str], num_cla
             for chunk in ratios_str.split(","):
                 name, value = chunk.split(":")
                 name = name.strip()
-                idx = int(name) if name.isdigit() else class_names.index(name)
+                idx = int(name) if name.isdigit() else class_name_to_idx[name.strip().lower()]
                 values[idx] = float(value)
         else:
             values = [float(x) for x in ratios_str.split(",")]
@@ -185,6 +195,12 @@ def _save_label_map(label: torch.Tensor, save_path: Path) -> None:
         array = label.astype(np.uint16)
         mode = "I;16"
     Image.fromarray(array, mode=mode).save(save_path)
+
+
+def _colorize_label_map(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
+    labels = label_map.detach().cpu().numpy().astype(np.int64)
+    labels = np.clip(labels, 0, len(palette) - 1)
+    return palette[labels]
 
 
 def _load_ratio_projector(checkpoint_dir: Path, num_classes: int, embed_dim: int) -> RatioProjector:
@@ -576,9 +592,13 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     image_path = Path(args.save_dir) / "image.png"
     layout_path = Path(args.save_dir) / "layout.png"
+    layout_color_path = Path(args.save_dir) / "layout_color.png"
     metadata_path = Path(args.save_dir) / "metadata.json"
     _save_uint8_rgb(image, image_path)
     _save_label_map(layout_ids_512[0], layout_path)
+    palette = build_palette(num_classes, class_names=class_names)
+    layout_color = _colorize_label_map(layout_ids_512[0], palette)
+    Image.fromarray(layout_color, mode="RGB").save(layout_color_path)
 
     metadata = {
         "prompt": prompt,
@@ -590,6 +610,7 @@ def main():
         "ratios": ratios.tolist(),
         "class_names": class_names,
         "layout_path": str(layout_path),
+        "layout_color_path": str(layout_color_path),
         "image_path": str(image_path),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
