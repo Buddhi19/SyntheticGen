@@ -54,7 +54,8 @@ def parse_args():
         choices=["loveda", "generic"],
         help="Dataset type to use.",
     )
-    parser.add_argument("--output_dir", type=str, default="outputs/layout_ddpm")
+    default_output_dir = str(Path(__file__).resolve().parents[2] / "outputsimproved" / "layout_ddpm")
+    parser.add_argument("--output_dir", type=str, default=default_output_dir)
     parser.add_argument("--image_size", type=int, default=512, help="Dataset image size (square).")
     parser.add_argument("--layout_size", type=int, default=64, help="Layout diffusion size (square).")
     parser.add_argument("--num_classes", type=int, default=None, help="Number of classes in the dataset.")

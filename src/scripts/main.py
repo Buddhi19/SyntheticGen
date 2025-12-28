@@ -7,10 +7,10 @@ from pathlib import Path
 main_dir = Path(__file__).resolve().parents[2]
 
 DEFAULT_DATA_ROOT = "/data/inr/llm/Datasets/LOVEDA"
-DEFAULT_LAYOUT_DIR = os.path.join(str(main_dir), "outputs", "layout_ddpm")
-DEFAULT_CONTROLNET_DIR = os.path.join(str(main_dir), "outputs", "controlnet_ratio")
-DEFAULT_SD_ADAPTER_DIR = os.path.join(str(main_dir), "outputs", "sd_unet_adapter")
-DEFAULT_SAVE_DIR = os.path.join(str(main_dir), "outputs", "synthetic_pairs")
+DEFAULT_LAYOUT_DIR = os.path.join(str(main_dir), "outputsimproved", "layout_ddpm")
+DEFAULT_CONTROLNET_DIR = os.path.join(str(main_dir), "outputsimproved", "controlnet_ratio")
+DEFAULT_SD_ADAPTER_DIR = os.path.join(str(main_dir), "outputsimproved", "sd_unet_adapter")
+DEFAULT_SAVE_DIR = os.path.join(str(main_dir), "outputsimproved", "synthetic_pairs")
 
 
 class ARG:

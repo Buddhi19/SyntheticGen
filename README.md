@@ -72,7 +72,7 @@ Stage A (layout DDPM):
 python src/scripts/train_layout_ddpm.py \
   --data_root /path/to/loveda \
   --dataset loveda \
-  --output_dir outputs/layout_ddpm \
+  --output_dir outputsimproved/layout_ddpm \
   --layout_size 128 \
   --checkpointing_steps 500 \
   --sample_num_inference_steps 50 \
@@ -88,7 +88,7 @@ python src/scripts/train_sd_unet_adapter.py \
   --pretrained_model_name_or_path /path/to/sd-v1-5 \
   --data_root /path/to/loveda \
   --dataset loveda \
-  --output_dir outputs/sd_unet_adapter \
+  --output_dir outputsimproved/sd_unet_adapter \
   --unet_trainable_up_blocks 2
 ```
 
@@ -97,11 +97,11 @@ Stage B (ControlNet + FiLM ratio conditioning):
 ```bash
 python src/scripts/train_controlnet_ratio.py \
   --pretrained_model_name_or_path /path/to/sd-v1-5 \
-  --unet_init outputs/sd_unet_adapter/unet \
+  --unet_init outputsimproved/sd_unet_adapter/unet \
   --data_root /path/to/loveda \
   --dataset loveda \
-  --output_dir outputs/controlnet_ratio \
-  --teacher_ckpt outputs/teacher_segnet.pt \
+  --output_dir outputsimproved/controlnet_ratio \
+  --teacher_ckpt outputsimproved/teacher_segnet.pt \
   --lambda_teacher_ce 0.5 \
   --lambda_teacher_ratio 1.0 \
   --unet_trainable_up_blocks 2 \
@@ -123,14 +123,14 @@ From scratch (ratios -> layout -> image):
 
 ```bash
 python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_ddpm \
-  --controlnet_ckpt outputs/controlnet_ratio \
+  --layout_ckpt outputsimproved/layout_ddpm \
+  --controlnet_ckpt outputsimproved/controlnet_ratio \
   --base_model /path/to/sd-v1-5 \
   --guidance_scale 5.0 \
   --controlnet_scale_start 1.0 \
   --controlnet_scale_end 0.5 \
   --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
-  --save_dir outputs/sample_pair
+  --save_dir outputsimproved/sample_pair
 ```
 
 Img2img with a provided mask:

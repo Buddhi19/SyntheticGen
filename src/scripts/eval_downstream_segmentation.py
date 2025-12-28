@@ -61,7 +61,8 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--output_path", type=str, default="outputs/eval_downstream_segmentation.json")
+    default_output_path = str(Path(__file__).resolve().parents[2] / "outputsimproved" / "eval_downstream_segmentation.json")
+    parser.add_argument("--output_path", type=str, default=default_output_path)
     parser.add_argument(
         "--save_ckpt",
         type=str,

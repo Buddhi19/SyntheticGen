@@ -45,7 +45,8 @@ if is_wandb_available():
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a lightweight SD UNet adapter (domain adaptation).")
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="outputs/sd_unet_adapter")
+    default_output_dir = str(Path(__file__).resolve().parents[2] / "outputsimproved" / "sd_unet_adapter")
+    parser.add_argument("--output_dir", type=str, default=default_output_dir)
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="generic", choices=["loveda", "generic"])
     parser.add_argument("--image_size", type=int, default=512)
@@ -391,4 +392,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -64,7 +64,8 @@ def parse_args():
         default=None,
         help="Optional path to a domain-adapted UNet directory (e.g. outputs/sd_unet_adapter/unet).",
     )
-    parser.add_argument("--output_dir", type=str, default="outputs/controlnet_ratio")
+    default_output_dir = str(Path(__file__).resolve().parents[2] / "outputsimproved" / "controlnet_ratio")
+    parser.add_argument("--output_dir", type=str, default=default_output_dir)
     parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
     parser.add_argument(
         "--dataset",
