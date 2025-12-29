@@ -29,6 +29,13 @@ except ImportError:  # direct execution
 logger = logging.getLogger(__name__)
 
 
+def _safe_torch_load(path: Path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate ratio control for layout generation.")
     parser.add_argument("--layout_ckpt", type=str, required=True, help="Layout DDPM checkpoint directory.")
@@ -112,7 +119,7 @@ def main():
     layout_size = layout_unet.config.sample_size
     time_embed_dim = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
     ratio_projector = RatioProjector(num_classes, time_embed_dim)
-    ratio_projector.load_state_dict(torch.load(layout_ckpt / "ratio_projector.bin", map_location="cpu"))
+    ratio_projector.load_state_dict(_safe_torch_load(layout_ckpt / "ratio_projector.bin", map_location="cpu"))
     scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
     dataset = _resolve_dataset(args, num_classes, layout_size)

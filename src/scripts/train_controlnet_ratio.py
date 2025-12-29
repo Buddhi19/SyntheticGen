@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument("--loveda_split", type=str, default="Train")
     parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
     parser.add_argument("--prompt", type=str, default="a high-resolution satellite image")
-    parser.add_argument("--train_batch_size", type=int, default=48)
+    parser.add_argument("--train_batch_size", type=int, default=24)
     parser.add_argument("--num_train_epochs", type=int, default=50)
     parser.add_argument("--max_train_steps", type=int, default=40000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -222,6 +222,13 @@ def _get_tb_writer(accelerator: Accelerator):
 def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
     labels = label_map.detach().cpu().numpy().astype(np.int64)
     return palette[labels]
+
+
+def _safe_torch_load(path: Path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
 
 def _sample_random_ratios_dirichlet(num_classes: int, alpha: float, seed: int, device: torch.device, dtype: torch.dtype):
@@ -559,7 +566,7 @@ def main():
         state_path = layout_ckpt / "ratio_projector.bin"
         if not state_path.is_file():
             raise FileNotFoundError(f"Layout ratio_projector not found at {state_path}")
-        layout_ratio_projector.load_state_dict(torch.load(state_path, map_location="cpu"))
+        layout_ratio_projector.load_state_dict(_safe_torch_load(state_path, map_location="cpu"))
         layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
         layout_unet.to(accelerator.device, dtype=weight_dtype)

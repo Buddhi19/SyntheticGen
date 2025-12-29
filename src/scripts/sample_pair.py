@@ -139,6 +139,13 @@ def rescale_noise_cfg(noise_cfg: torch.Tensor, noise_pred_text: torch.Tensor, gu
     return noise_cfg
 
 
+def _safe_torch_load(path: Path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def _load_json(path: Path) -> Optional[Dict]:
     if not path or not path.is_file():
         return None
@@ -234,7 +241,7 @@ def _load_ratio_projector(checkpoint_dir: Path, num_classes: int, embed_dim: int
     state_path = checkpoint_dir / "ratio_projector.bin"
     if not state_path.is_file():
         raise FileNotFoundError(f"ratio_projector not found at {state_path}")
-    projector.load_state_dict(torch.load(state_path, map_location="cpu"))
+    projector.load_state_dict(_safe_torch_load(state_path, map_location="cpu"))
     return projector
 
 
@@ -311,7 +318,7 @@ def _load_segmentation_model(seg_arch: str, num_classes: int, ckpt_path: Optiona
     if not ckpt_path:
         raise ValueError("--seg_ckpt is required for image-only editing.")
     model = SimpleSegNet(num_classes)
-    state = torch.load(ckpt_path, map_location="cpu")
+    state = _safe_torch_load(Path(ckpt_path), map_location="cpu")
     if isinstance(state, dict):
         if "state_dict" in state:
             state = state["state_dict"]
@@ -460,7 +467,7 @@ def main():
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
     ratio_projector = _load_ratio_projector(controlnet_ckpt, num_classes, time_embed_dim)
-    gate_state = torch.load(controlnet_ckpt / "film_gate.bin", map_location="cpu")
+    gate_state = _safe_torch_load(controlnet_ckpt / "film_gate.bin", map_location="cpu")
     if isinstance(gate_state, dict) and "proj.weight" in gate_state:
         film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=_infer_num_down_residuals(controlnet))
     elif isinstance(gate_state, dict) and any(str(k).startswith("down_mlps.") for k in gate_state.keys()):
