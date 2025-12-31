@@ -130,6 +130,32 @@ def parse_args():
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--noise_offset", type=float, default=0.0, help="Optional offset noise strength (0 disables).")
     parser.add_argument(
+        "--lora_path",
+        type=str,
+        default=None,
+        help="Path to UNet LoRA dir (saved by save_attn_procs).",
+    )
+    parser.add_argument(
+        "--lora_weight_name",
+        type=str,
+        default="pytorch_lora_weights.safetensors",
+        help="LoRA weight filename inside lora_path.",
+    )
+    parser.add_argument("--lora_scale", type=float, default=1.0, help="LoRA scale (0 disables; 1 full).")
+    parser.add_argument(
+        "--lora_unfreeze_step",
+        type=int,
+        default=-1,
+        help="Global step to start training UNet LoRA. -1 disables.",
+    )
+    parser.add_argument(
+        "--lora_lr",
+        type=float,
+        default=None,
+        help="LR for LoRA params after unfreeze. If None, uses 0.1 * learning_rate.",
+    )
+    parser.add_argument("--lora_weight_decay", type=float, default=0.0)
+    parser.add_argument(
         "--layout_ckpt_for_sampling",
         type=str,
         default=None,
@@ -207,6 +233,28 @@ def _infer_num_down_residuals(controlnet) -> int:
 def _ensure_identity_class_embedding(model):
     model.register_to_config(class_embed_type="identity", num_class_embeds=None, projection_class_embeddings_input_dim=None)
     model.class_embedding = nn.Identity()
+
+
+def _get_unet_lora_parameters(unet: UNet2DConditionModel):
+    params = []
+    for proc in unet.attn_processors.values():
+        if hasattr(proc, "parameters"):
+            params.extend(list(proc.parameters()))
+    unique = []
+    seen = set()
+    for param in params:
+        if id(param) not in seen:
+            seen.add(id(param))
+            unique.append(param)
+    return unique
+
+
+def _set_lora_lr(optimizer, lr_scheduler, group_index: int, lr: float) -> None:
+    optimizer.param_groups[group_index]["lr"] = lr
+    if "initial_lr" in optimizer.param_groups[group_index]:
+        optimizer.param_groups[group_index]["initial_lr"] = lr
+    if lr_scheduler is not None and hasattr(lr_scheduler, "base_lrs"):
+        lr_scheduler.base_lrs[group_index] = lr
 
 
 def _get_tb_writer(accelerator: Accelerator):
@@ -308,11 +356,17 @@ def _log_controlnet_sample(
     seed: int,
     palette: np.ndarray,
     num_inference_steps: int,
+    lora_scale: float,
 ) -> None:
     writer = _get_tb_writer(accelerator)
     generator = torch.Generator(device=layouts.device).manual_seed(seed)
 
+    ratio_dtype = next(ratio_projector.parameters()).dtype
+    ratios = ratios.to(device=layouts.device, dtype=ratio_dtype)
     ratio_emb = ratio_projector(ratios.unsqueeze(0)).to(dtype=prompt_embeds.dtype)
+    cross_kwargs = None
+    if lora_scale is not None and float(lora_scale) != 1.0:
+        cross_kwargs = {"scale": float(lora_scale)}
     latents = torch.randn(
         (1, unet.config.in_channels, layouts.shape[-1] // 8, layouts.shape[-1] // 8),
         generator=generator,
@@ -342,6 +396,7 @@ def _log_controlnet_sample(
                 class_labels=ratio_emb,
                 down_block_additional_residuals=down_samples,
                 mid_block_additional_residual=mid_sample,
+                cross_attention_kwargs=cross_kwargs,
             ).sample
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
             latents = latents.to(dtype=prompt_embeds.dtype)
@@ -426,6 +481,9 @@ def main():
     _ensure_identity_class_embedding(unet)
     controlnet = ControlNetModel.from_unet(unet, conditioning_channels=num_classes)
     _ensure_identity_class_embedding(controlnet)
+    if args.lora_path is not None:
+        unet.load_attn_procs(args.lora_path, weight_name=args.lora_weight_name)
+        logger.info("Loaded UNet LoRA from %s (%s)", args.lora_path, args.lora_weight_name)
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -433,6 +491,11 @@ def main():
     unet.eval()
     vae.eval()
     text_encoder.eval()
+    unet_lora_params = []
+    if args.lora_path is not None:
+        unet_lora_params = _get_unet_lora_parameters(unet)
+        for param in unet_lora_params:
+            param.requires_grad_(False)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -486,12 +549,37 @@ def main():
     if args.scale_lr:
         args.learning_rate = args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size
 
+    base_lr = args.learning_rate
+    lora_lr = args.lora_lr if args.lora_lr is not None else (0.1 * base_lr)
+    control_params = list(chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()))
+    param_groups = [
+        {
+            "params": control_params,
+            "lr": base_lr,
+            "weight_decay": args.adam_weight_decay,
+            "name": "control",
+        }
+    ]
+    lora_group_index = None
+    if unet_lora_params:
+        lora_group_index = len(param_groups)
+        param_groups.append(
+            {
+                "params": unet_lora_params,
+                "lr": 0.0,
+                "weight_decay": args.lora_weight_decay,
+                "name": "lora",
+            }
+        )
+
     optimizer = torch.optim.AdamW(
-        chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()),
-        lr=args.learning_rate,
+        param_groups,
         betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
+    )
+
+    controlnet, ratio_projector, film_gate, optimizer, train_dataloader = accelerator.prepare(
+        controlnet, ratio_projector, film_gate, optimizer, train_dataloader
     )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -505,10 +593,7 @@ def main():
         num_warmup_steps=args.lr_warmup_steps,
         num_training_steps=args.max_train_steps,
     )
-
-    controlnet, ratio_projector, film_gate, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        controlnet, ratio_projector, film_gate, optimizer, train_dataloader, lr_scheduler
-    )
+    accelerator.register_for_checkpointing(lr_scheduler)
 
     weight_dtype = torch.float32
     if accelerator.device.type == "cuda":
@@ -583,8 +668,27 @@ def main():
             global_step = int(os.path.basename(args.resume_from_checkpoint).split("-")[1])
             first_epoch = global_step // num_update_steps_per_epoch
 
+    if (
+        lora_group_index is not None
+        and args.lora_unfreeze_step is not None
+        and args.lora_unfreeze_step >= 0
+        and global_step >= args.lora_unfreeze_step
+    ):
+        for param in unet_lora_params:
+            param.requires_grad_(True)
+        _set_lora_lr(optimizer, lr_scheduler, lora_group_index, lora_lr)
+        logger.info(
+            "[Stage B.1] UNet LoRA trainable from step=%d; lora_lr=%.2e",
+            global_step,
+            lora_lr,
+        )
+
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+    lora_scale = args.lora_scale if args.lora_scale is not None else 1.0
+    lora_cross_kwargs = None
+    if args.lora_path is not None and float(lora_scale) != 1.0:
+        lora_cross_kwargs = {"scale": float(lora_scale)}
 
     for epoch in range(first_epoch, args.num_train_epochs):
         controlnet.train()
@@ -656,6 +760,7 @@ def main():
                     class_labels=ratio_emb,
                     down_block_additional_residuals=down_samples,
                     mid_block_additional_residual=mid_sample,
+                    cross_attention_kwargs=lora_cross_kwargs,
                 ).sample
 
                 if args.snr_gamma and args.snr_gamma > 0:
@@ -691,6 +796,20 @@ def main():
                     ema_film_gate.step(film_gate.parameters())
                 progress_bar.update(1)
                 global_step += 1
+                if (
+                    lora_group_index is not None
+                    and args.lora_unfreeze_step is not None
+                    and args.lora_unfreeze_step > 0
+                    and global_step == args.lora_unfreeze_step
+                ):
+                    for param in unet_lora_params:
+                        param.requires_grad_(True)
+                    _set_lora_lr(optimizer, lr_scheduler, lora_group_index, lora_lr)
+                    logger.info(
+                        "[Stage B.1] Unfroze UNet LoRA at step=%d; lora_lr=%.2e",
+                        global_step,
+                        lora_lr,
+                    )
                 if global_step % args.logging_steps == 0:
                     accelerator.log({"train_loss": loss.detach().item()}, step=global_step)
 
@@ -751,6 +870,7 @@ def main():
                             seed=args.sample_seed,
                             palette=palette,
                             num_inference_steps=args.sample_num_inference_steps,
+                            lora_scale=lora_scale,
                         )
                         if layout_sampler is not None:
                             samples_dir = Path(args.output_dir) / "samples"
@@ -812,6 +932,11 @@ def main():
                     "noise_offset": args.noise_offset,
                     "use_ema": args.use_ema,
                     "ema_decay": args.ema_decay,
+                    "lora_path": args.lora_path,
+                    "lora_weight_name": args.lora_weight_name,
+                    "lora_scale": args.lora_scale,
+                    "lora_unfreeze_step": args.lora_unfreeze_step,
+                    "lora_lr": args.lora_lr,
                 },
                 handle,
                 indent=2,

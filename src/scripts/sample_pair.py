@@ -57,6 +57,14 @@ def parse_args():
     parser.add_argument("--layout_ckpt", type=str, required=True, help="Layout DDPM checkpoint directory.")
     parser.add_argument("--controlnet_ckpt", type=str, required=True, help="ControlNet checkpoint directory.")
     parser.add_argument("--base_model", type=str, default=None, help="Base SD model path or ID.")
+    parser.add_argument("--lora_path", type=str, default=None, help="Optional UNet LoRA dir (save_attn_procs).")
+    parser.add_argument(
+        "--lora_weight_name",
+        type=str,
+        default="pytorch_lora_weights.safetensors",
+        help="LoRA weight filename inside lora_path.",
+    )
+    parser.add_argument("--lora_scale", type=float, default=1.0, help="LoRA scale (0 disables; 1 full).")
     parser.add_argument("--save_dir", type=str, required=True, help="Directory to save outputs.")
     parser.add_argument("--ratios", type=str, default=None, help="Ratios as CSV or name:value pairs.")
     parser.add_argument("--ratios_json", type=str, default=None, help="JSON file with ratios list/dict.")
@@ -396,7 +404,8 @@ def main():
         init_mask_tensor = _resize_mask(seg_mask, layout_size)
         mask_format = "indexed"
 
-    ratio_emb_layout = layout_ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
+    ratios_device = ratios.to(device=device, dtype=weight_dtype)
+    ratio_emb_layout = layout_ratio_projector(ratios_device.unsqueeze(0)).to(dtype=weight_dtype)
     layout_scheduler.set_timesteps(args.num_inference_steps_layout, device=device)
     if init_mask_tensor is not None:
         init_mask = init_mask_tensor.to(device)
@@ -425,7 +434,6 @@ def main():
         layout_latents = layout_latents * layout_scheduler.init_noise_sigma
         timesteps = layout_scheduler.timesteps
 
-    ratios_device = ratios.to(device=device, dtype=weight_dtype)
     alphas_cumprod = layout_scheduler.alphas_cumprod.to(device=device, dtype=layout_latents.dtype)
     with torch.no_grad():
         for timestep in timesteps:
@@ -460,6 +468,9 @@ def main():
     text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder", torch_dtype=weight_dtype)
     vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae", torch_dtype=weight_dtype)
     unet = UNet2DConditionModel.from_pretrained(base_model, subfolder="unet", torch_dtype=weight_dtype)
+    if args.lora_path is not None:
+        unet.load_attn_procs(args.lora_path, weight_name=args.lora_weight_name)
+        logger.info("Loaded UNet LoRA from %s (%s)", args.lora_path, args.lora_weight_name)
     controlnet = ControlNetModel.from_pretrained(controlnet_ckpt / "controlnet", torch_dtype=weight_dtype)
 
     _ensure_identity_class_embedding(unet)
@@ -530,11 +541,15 @@ def main():
         uncond_embeds = text_encoder(uncond_inputs.input_ids.to(device))[0]
     uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
 
-    ratio_emb = ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
+    ratio_emb = ratio_projector(ratios_device.unsqueeze(0)).to(dtype=weight_dtype)
     layout_cond = layout_onehot_512.to(device=device, dtype=weight_dtype)
     layout_uncond = torch.zeros_like(layout_cond)
     ratio_uncond = torch.zeros_like(ratio_emb)
     scheduler.set_timesteps(args.num_inference_steps_image, device=device)
+    lora_scale = args.lora_scale if args.lora_scale is not None else 1.0
+    lora_cross_kwargs = None
+    if args.lora_path is not None and float(lora_scale) != 1.0:
+        lora_cross_kwargs = {"scale": float(lora_scale)}
     if args.init_image:
         if init_image_tensor is None:
             init_image_tensor = _load_init_image(args.init_image, args.image_size)
@@ -598,6 +613,7 @@ def main():
                 class_labels=class_labels,
                 down_block_additional_residuals=down_samples,
                 mid_block_additional_residual=mid_sample,
+                cross_attention_kwargs=lora_cross_kwargs,
             ).sample
 
             if do_cfg:
