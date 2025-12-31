@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from typing import List, Tuple
 
 
 def infer_time_embed_dim_from_config(block_out_channels) -> int:
@@ -39,4 +40,45 @@ class ResidualFiLMGate(nn.Module):
         g = gamma[:, -1].view(-1, 1, 1, 1).to(mid_residual.dtype)
         b = beta[:, -1].view(-1, 1, 1, 1).to(mid_residual.dtype)
         out_mid = mid_residual * (1.0 + g) + b
+        return tuple(out_down), out_mid
+
+
+class PerChannelResidualFiLMGate(nn.Module):
+    def __init__(
+        self,
+        ratio_embed_dim: int,
+        down_channels: List[int],
+        mid_channels: int,
+        init_zero: bool = True,
+    ) -> None:
+        super().__init__()
+        self.down_mlps = nn.ModuleList([nn.Linear(ratio_embed_dim, 2 * int(c)) for c in down_channels])
+        self.mid_mlp = nn.Linear(ratio_embed_dim, 2 * int(mid_channels))
+
+        if init_zero:
+            for mlp in self.down_mlps:
+                nn.init.zeros_(mlp.weight)
+                nn.init.zeros_(mlp.bias)
+            nn.init.zeros_(self.mid_mlp.weight)
+            nn.init.zeros_(self.mid_mlp.bias)
+
+    def forward(
+        self,
+        ratio_emb: torch.Tensor,
+        down_residuals: Tuple[torch.Tensor, ...],
+        mid_residual: torch.Tensor,
+    ):
+        if len(down_residuals) != len(self.down_mlps):
+            raise ValueError(f"Expected {len(self.down_mlps)} down residuals, got {len(down_residuals)}.")
+
+        out_down = []
+        for residual, mlp in zip(down_residuals, self.down_mlps):
+            params = mlp(ratio_emb).to(dtype=residual.dtype)
+            params = params.unsqueeze(-1).unsqueeze(-1)
+            gamma, beta = params.chunk(2, dim=1)
+            out_down.append(residual * (1.0 + gamma) + beta)
+
+        mid_params = self.mid_mlp(ratio_emb).to(dtype=mid_residual.dtype).unsqueeze(-1).unsqueeze(-1)
+        mid_gamma, mid_beta = mid_params.chunk(2, dim=1)
+        out_mid = mid_residual * (1.0 + mid_gamma) + mid_beta
         return tuple(out_down), out_mid

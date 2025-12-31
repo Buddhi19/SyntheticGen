@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import json
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
@@ -19,6 +20,60 @@ DEFAULT_LOVEDA_CLASS_NAMES = [
     "forest",
     "agriculture",
 ]
+
+COLOR_MAP_LOVEDA = OrderedDict(
+    Background=(255, 255, 255),
+    Building=(255, 0, 0),
+    Road=(255, 255, 0),
+    Water=(0, 0, 255),
+    Barren=(159, 129, 183),
+    Forest=(0, 255, 0),
+    Agricultural=(255, 195, 128),
+)
+
+LABEL_MAP_LOVEDA = OrderedDict(
+    Background=0,
+    Building=1,
+    Road=2,
+    Water=3,
+    Barren=4,
+    Forest=5,
+    Agricultural=6,
+)
+
+
+def _normalize_class_name(name: str) -> str:
+    return str(name).strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+_LOVEDA_CANONICAL_BY_NORMALIZED = {
+    "background": "Background",
+    "building": "Building",
+    "road": "Road",
+    "water": "Water",
+    "barren": "Barren",
+    "forest": "Forest",
+    "agriculture": "Agricultural",
+    "agricultural": "Agricultural",
+}
+
+
+def build_palette(class_names: Sequence[str], num_classes: int, dataset: Optional[str] = None) -> np.ndarray:
+    names = [str(x) for x in class_names[:num_classes]]
+    looks_like_loveda = all(_normalize_class_name(name) in _LOVEDA_CANONICAL_BY_NORMALIZED for name in names)
+    if dataset == "loveda" or looks_like_loveda:
+        palette = np.zeros((num_classes, 3), dtype=np.uint8)
+        for idx, name in enumerate(names):
+            canonical = _LOVEDA_CANONICAL_BY_NORMALIZED.get(_normalize_class_name(name))
+            if canonical is None:
+                raise ValueError(f"Unknown LoveDA class name: {name}")
+            palette[idx] = np.array(COLOR_MAP_LOVEDA[canonical], dtype=np.uint8)
+        return palette
+
+    rng = np.random.default_rng(0)
+    colors = rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
+    colors[0] = np.array([0, 0, 0], dtype=np.uint8)
+    return colors
 
 
 def remap_loveda_labels(arr: np.ndarray, ignore_index: int = 255) -> np.ndarray:

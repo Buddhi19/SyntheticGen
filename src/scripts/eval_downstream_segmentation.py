@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--output_path", type=str, default="outputs/eval_downstream_segmentation.json")
+    parser.add_argument("--output_path", type=str, default="outputsV2/eval_downstream_segmentation.json")
     return parser.parse_args()
 
 

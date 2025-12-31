@@ -29,6 +29,13 @@ except ImportError:  # direct execution
 logger = logging.getLogger(__name__)
 
 
+def _safe_torch_load(path: Path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate ratio control for layout generation.")
     parser.add_argument("--layout_ckpt", type=str, required=True, help="Layout DDPM checkpoint directory.")
@@ -49,7 +56,7 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--output_path", type=str, default="outputs/eval_ratio_control.json")
+    parser.add_argument("--output_path", type=str, default="outputsV2/eval_ratio_control.json")
     parser.add_argument("--errors_path", type=str, default=None, help="Optional JSON path for per-sample errors.")
     return parser.parse_args()
 
@@ -112,7 +119,7 @@ def main():
     layout_size = layout_unet.config.sample_size
     time_embed_dim = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
     ratio_projector = RatioProjector(num_classes, time_embed_dim)
-    ratio_projector.load_state_dict(torch.load(layout_ckpt / "ratio_projector.bin", map_location="cpu"))
+    ratio_projector.load_state_dict(_safe_torch_load(layout_ckpt / "ratio_projector.bin", map_location="cpu"))
     scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
     dataset = _resolve_dataset(args, num_classes, layout_size)

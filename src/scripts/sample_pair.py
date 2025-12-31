@@ -16,16 +16,36 @@ import torch.nn.functional as F
 from PIL import Image, ImageOps
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from diffusers import AutoencoderKL, ControlNetModel, DDIMScheduler, DDPMScheduler, UNet2DConditionModel, UNet2DModel
+from diffusers import (
+    AutoencoderKL,
+    ControlNetModel,
+    DDIMScheduler,
+    DDPMScheduler,
+    DPMSolverMultistepScheduler,
+    UNet2DConditionModel,
+    UNet2DModel,
+)
 
 try:
-    from ..models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from .dataset_loveda import build_palette
+    from ..models.ratio_conditioning import (
+        PerChannelResidualFiLMGate,
+        RatioProjector,
+        ResidualFiLMGate,
+        infer_time_embed_dim_from_config,
+    )
     from ..models.segmentation import SimpleSegNet
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from src.models.ratio_conditioning import RatioProjector, ResidualFiLMGate, infer_time_embed_dim_from_config
+    from src.scripts.dataset_loveda import build_palette
+    from src.models.ratio_conditioning import (
+        PerChannelResidualFiLMGate,
+        RatioProjector,
+        ResidualFiLMGate,
+        infer_time_embed_dim_from_config,
+    )
     from src.models.segmentation import SimpleSegNet
 
 
@@ -37,6 +57,14 @@ def parse_args():
     parser.add_argument("--layout_ckpt", type=str, required=True, help="Layout DDPM checkpoint directory.")
     parser.add_argument("--controlnet_ckpt", type=str, required=True, help="ControlNet checkpoint directory.")
     parser.add_argument("--base_model", type=str, default=None, help="Base SD model path or ID.")
+    parser.add_argument("--lora_path", type=str, default=None, help="Optional UNet LoRA dir (save_attn_procs).")
+    parser.add_argument(
+        "--lora_weight_name",
+        type=str,
+        default="pytorch_lora_weights.safetensors",
+        help="LoRA weight filename inside lora_path.",
+    )
+    parser.add_argument("--lora_scale", type=float, default=1.0, help="LoRA scale (0 disables; 1 full).")
     parser.add_argument("--save_dir", type=str, required=True, help="Directory to save outputs.")
     parser.add_argument("--ratios", type=str, default=None, help="Ratios as CSV or name:value pairs.")
     parser.add_argument("--ratios_json", type=str, default=None, help="JSON file with ratios list/dict.")
@@ -69,13 +97,35 @@ def parse_args():
     )
     parser.add_argument("--hist_guidance_scale", type=float, default=0.0, help="Histogram guidance scale for layouts.")
     parser.add_argument("--hist_guidance_temp", type=float, default=1.0, help="Softmax temperature for histogram guidance.")
+    parser.add_argument("--guidance_scale", type=float, default=5.0)
+    parser.add_argument(
+        "--guidance_rescale",
+        type=float,
+        default=0.0,
+        help="Optional CFG rescale to reduce overexposure/artifacts.",
+    )
+    parser.add_argument("--use_karras_sigmas", action="store_true")
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        default="dpmpp_2m",
+        choices=["ddim", "ddpm", "dpmpp_2m"],
+        help="Image sampler for the second-stage diffusion model.",
+    )
+    parser.add_argument(
+        "--scheduler",
+        dest="sampler",
+        type=str,
+        default=argparse.SUPPRESS,
+        choices=["ddim", "ddpm", "dpmpp_2m"],
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--num_inference_steps_layout", type=int, default=50)
     parser.add_argument("--num_inference_steps_image", type=int, default=30)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--scheduler", type=str, default="ddim", choices=["ddim", "ddpm"])
     return parser.parse_args()
 
 
@@ -87,6 +137,21 @@ def resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
     if dtype == "bf16":
         return torch.bfloat16
     return torch.float32
+
+
+def rescale_noise_cfg(noise_cfg: torch.Tensor, noise_pred_text: torch.Tensor, guidance_rescale: float = 0.0) -> torch.Tensor:
+    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+    return noise_cfg
+
+
+def _safe_torch_load(path: Path, map_location="cpu"):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
 
 
 def _load_json(path: Path) -> Optional[Dict]:
@@ -174,12 +239,17 @@ def _save_label_map(label: torch.Tensor, save_path: Path) -> None:
     Image.fromarray(array, mode=mode).save(save_path)
 
 
+def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
+    labels = label_map.detach().cpu().numpy().astype(np.int64)
+    return palette[labels]
+
+
 def _load_ratio_projector(checkpoint_dir: Path, num_classes: int, embed_dim: int) -> RatioProjector:
     projector = RatioProjector(num_classes, embed_dim)
     state_path = checkpoint_dir / "ratio_projector.bin"
     if not state_path.is_file():
         raise FileNotFoundError(f"ratio_projector not found at {state_path}")
-    projector.load_state_dict(torch.load(state_path, map_location="cpu"))
+    projector.load_state_dict(_safe_torch_load(state_path, map_location="cpu"))
     return projector
 
 
@@ -256,7 +326,7 @@ def _load_segmentation_model(seg_arch: str, num_classes: int, ckpt_path: Optiona
     if not ckpt_path:
         raise ValueError("--seg_ckpt is required for image-only editing.")
     model = SimpleSegNet(num_classes)
-    state = torch.load(ckpt_path, map_location="cpu")
+    state = _safe_torch_load(Path(ckpt_path), map_location="cpu")
     if isinstance(state, dict):
         if "state_dict" in state:
             state = state["state_dict"]
@@ -334,7 +404,8 @@ def main():
         init_mask_tensor = _resize_mask(seg_mask, layout_size)
         mask_format = "indexed"
 
-    ratio_emb_layout = layout_ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
+    ratios_device = ratios.to(device=device, dtype=weight_dtype)
+    ratio_emb_layout = layout_ratio_projector(ratios_device.unsqueeze(0)).to(dtype=weight_dtype)
     layout_scheduler.set_timesteps(args.num_inference_steps_layout, device=device)
     if init_mask_tensor is not None:
         init_mask = init_mask_tensor.to(device)
@@ -363,7 +434,6 @@ def main():
         layout_latents = layout_latents * layout_scheduler.init_noise_sigma
         timesteps = layout_scheduler.timesteps
 
-    ratios_device = ratios.to(device=device, dtype=weight_dtype)
     alphas_cumprod = layout_scheduler.alphas_cumprod.to(device=device, dtype=layout_latents.dtype)
     with torch.no_grad():
         for timestep in timesteps:
@@ -392,11 +462,15 @@ def main():
     if not base_model:
         raise ValueError("base_model is required. Pass --base_model or include it in controlnet training_config.json.")
     prompt = args.prompt or training_config.get("prompt") or "a high-resolution satellite image"
+    palette = build_palette(class_names, num_classes, dataset=training_config.get("dataset"))
 
     tokenizer = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder", torch_dtype=weight_dtype)
     vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae", torch_dtype=weight_dtype)
     unet = UNet2DConditionModel.from_pretrained(base_model, subfolder="unet", torch_dtype=weight_dtype)
+    if args.lora_path is not None:
+        unet.load_attn_procs(args.lora_path, weight_name=args.lora_weight_name)
+        logger.info("Loaded UNet LoRA from %s (%s)", args.lora_path, args.lora_weight_name)
     controlnet = ControlNetModel.from_pretrained(controlnet_ckpt / "controlnet", torch_dtype=weight_dtype)
 
     _ensure_identity_class_embedding(unet)
@@ -404,13 +478,32 @@ def main():
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
     ratio_projector = _load_ratio_projector(controlnet_ckpt, num_classes, time_embed_dim)
-    film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=_infer_num_down_residuals(controlnet))
-    film_gate.load_state_dict(torch.load(controlnet_ckpt / "film_gate.bin", map_location="cpu"))
-
-    if args.scheduler == "ddim":
-        scheduler = DDIMScheduler.from_pretrained(base_model, subfolder="scheduler")
+    gate_state = _safe_torch_load(controlnet_ckpt / "film_gate.bin", map_location="cpu")
+    if isinstance(gate_state, dict) and "proj.weight" in gate_state:
+        film_gate = ResidualFiLMGate(time_embed_dim, n_down_blocks=_infer_num_down_residuals(controlnet))
+    elif isinstance(gate_state, dict) and any(str(k).startswith("down_mlps.") for k in gate_state.keys()):
+        down_channels = [int(block.out_channels) for block in controlnet.controlnet_down_blocks]
+        mid_channels = int(controlnet.controlnet_mid_block.out_channels)
+        film_gate = PerChannelResidualFiLMGate(
+            time_embed_dim,
+            down_channels=down_channels,
+            mid_channels=mid_channels,
+            init_zero=False,
+        )
     else:
+        raise ValueError(f"Unrecognized FiLM gate checkpoint format: {controlnet_ckpt / 'film_gate.bin'}")
+    film_gate.load_state_dict(gate_state)
+
+    if args.sampler == "dpmpp_2m":
+        scheduler = DPMSolverMultistepScheduler.from_pretrained(
+            base_model,
+            subfolder="scheduler",
+            use_karras_sigmas=args.use_karras_sigmas,
+        )
+    elif args.sampler == "ddpm":
         scheduler = DDPMScheduler.from_pretrained(base_model, subfolder="scheduler")
+    else:
+        scheduler = DDIMScheduler.from_pretrained(base_model, subfolder="scheduler")
 
     text_encoder.to(device, dtype=weight_dtype)
     vae.to(device, dtype=weight_dtype)
@@ -437,9 +530,26 @@ def main():
         prompt_embeds = text_encoder(text_inputs.input_ids.to(device))[0]
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
 
-    ratio_emb = ratio_projector(ratios.unsqueeze(0).to(device)).to(dtype=weight_dtype)
+    uncond_inputs = tokenizer(
+        [""],
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        uncond_embeds = text_encoder(uncond_inputs.input_ids.to(device))[0]
+    uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
+
+    ratio_emb = ratio_projector(ratios_device.unsqueeze(0)).to(dtype=weight_dtype)
     layout_cond = layout_onehot_512.to(device=device, dtype=weight_dtype)
+    layout_uncond = torch.zeros_like(layout_cond)
+    ratio_uncond = torch.zeros_like(ratio_emb)
     scheduler.set_timesteps(args.num_inference_steps_image, device=device)
+    lora_scale = args.lora_scale if args.lora_scale is not None else 1.0
+    lora_cross_kwargs = None
+    if args.lora_path is not None and float(lora_scale) != 1.0:
+        lora_cross_kwargs = {"scale": float(lora_scale)}
     if args.init_image:
         if init_image_tensor is None:
             init_image_tensor = _load_init_image(args.init_image, args.image_size)
@@ -469,26 +579,50 @@ def main():
         latents = latents * scheduler.init_noise_sigma
         timesteps = scheduler.timesteps
 
+    do_cfg = args.guidance_scale is not None and float(args.guidance_scale) != 1.0
     with torch.no_grad():
         for timestep in timesteps:
+            if do_cfg:
+                latent_model_input = torch.cat([latents] * 2, dim=0)
+                encoder_hidden_states = torch.cat([uncond_embeds, prompt_embeds], dim=0)
+                controlnet_cond = torch.cat([layout_uncond, layout_cond], dim=0)
+                class_labels = torch.cat([ratio_uncond, ratio_emb], dim=0)
+            else:
+                latent_model_input = latents
+                encoder_hidden_states = prompt_embeds
+                controlnet_cond = layout_cond
+                class_labels = ratio_emb
+
+            if hasattr(scheduler, "scale_model_input"):
+                latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
+
             down_samples, mid_sample = controlnet(
-                latents,
+                latent_model_input,
                 timestep,
-                encoder_hidden_states=prompt_embeds,
-                controlnet_cond=layout_cond,
-                class_labels=ratio_emb,
+                encoder_hidden_states=encoder_hidden_states,
+                controlnet_cond=controlnet_cond,
+                class_labels=class_labels,
                 return_dict=False,
             )
-            down_samples, mid_sample = film_gate(ratio_emb, down_samples, mid_sample)
+            down_samples, mid_sample = film_gate(class_labels, down_samples, mid_sample)
 
             noise_pred = unet(
-                latents,
+                latent_model_input,
                 timestep,
-                encoder_hidden_states=prompt_embeds,
-                class_labels=ratio_emb,
+                encoder_hidden_states=encoder_hidden_states,
+                class_labels=class_labels,
                 down_block_additional_residuals=down_samples,
                 mid_block_additional_residual=mid_sample,
+                cross_attention_kwargs=lora_cross_kwargs,
             ).sample
+
+            if do_cfg:
+                noise_uncond, noise_text = noise_pred.chunk(2)
+                noise_cfg = noise_uncond + float(args.guidance_scale) * (noise_text - noise_uncond)
+                if args.guidance_rescale and args.guidance_rescale > 0:
+                    noise_cfg = rescale_noise_cfg(noise_cfg, noise_text, guidance_rescale=float(args.guidance_rescale))
+                noise_pred = noise_cfg
+
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
     image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
@@ -496,15 +630,19 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     image_path = Path(args.save_dir) / "image.png"
     layout_path = Path(args.save_dir) / "layout.png"
+    layout_color_path = Path(args.save_dir) / "layout_color.png"
     metadata_path = Path(args.save_dir) / "metadata.json"
     _save_uint8_rgb(image, image_path)
     _save_label_map(layout_ids_512[0], layout_path)
+    layout_color = _colorize_labels(layout_ids_512[0], palette)
+    Image.fromarray(layout_color, mode="RGB").save(layout_color_path)
 
     metadata = {
         "prompt": prompt,
         "ratios": ratios.tolist(),
         "class_names": class_names,
         "layout_path": str(layout_path),
+        "layout_color_path": str(layout_color_path),
         "image_path": str(image_path),
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
