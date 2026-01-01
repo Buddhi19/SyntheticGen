@@ -89,6 +89,24 @@ def parse_args():
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--lambda_ratio", type=float, default=1.0)
     parser.add_argument("--ratio_temp", type=float, default=1.0)
+    parser.add_argument(
+        "--ratio_pool",
+        type=int,
+        default=8,
+        help="Average-pool kernel/stride used before computing ratio loss. 1 disables.",
+    )
+    parser.add_argument(
+        "--lambda_tv",
+        type=float,
+        default=0.0,
+        help="Weight for TV smoothness loss on probs. 0 disables.",
+    )
+    parser.add_argument(
+        "--viz_smooth",
+        type=int,
+        default=0,
+        help="Optional avg-pool kernel for visualization before argmax (0 disables).",
+    )
     parser.add_argument("--sample_num_inference_steps", type=int, default=50)
     parser.add_argument("--sample_seed", type=int, default=0)
     parser.add_argument("--seed", type=int, default=None)
@@ -161,6 +179,9 @@ def _log_layout_sample(
     output_dir: str,
     step: int,
     seed: int,
+    ratio_pool: int,
+    ratio_temp: float,
+    viz_smooth: int,
 ) -> None:
     writer = _get_tb_writer(accelerator)
     generator = torch.Generator(device=ratios.device).manual_seed(seed)
@@ -178,7 +199,26 @@ def _log_layout_sample(
             noise_pred = unet(layout_latents, timestep, class_labels=ratio_emb).sample
             layout_latents = noise_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
 
-    layout_ids = layout_latents.argmax(dim=1)[0]
+    probs = torch.softmax(layout_latents / float(ratio_temp), dim=1)
+    valid = torch.ones((1, 1, layout_size, layout_size), device=layout_latents.device, dtype=probs.dtype)
+    if ratio_pool is not None and int(ratio_pool) > 1:
+        k = int(ratio_pool)
+        probs_p = F.avg_pool2d(probs, kernel_size=k, stride=k)
+        valid_p = F.avg_pool2d(valid, kernel_size=k, stride=k)
+    else:
+        probs_p = probs
+        valid_p = valid
+    weighted = (probs_p * valid_p).sum(dim=(2, 3))
+    denom = valid_p.sum(dim=(2, 3)).clamp(min=1.0)
+    r_hat = (weighted / denom)[0]
+    ratio_mae = (r_hat.float() - ratios.float()).abs().mean()
+
+    layout_logits = layout_latents
+    if viz_smooth is not None and int(viz_smooth) > 1:
+        k = int(viz_smooth)
+        pad = k // 2
+        layout_logits = F.avg_pool2d(layout_logits, kernel_size=k, stride=1, padding=pad)
+    layout_ids = layout_logits.argmax(dim=1)[0]
     color = _colorize_labels(layout_ids, palette)
     samples_dir = Path(output_dir) / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
@@ -187,6 +227,7 @@ def _log_layout_sample(
 
     if writer is not None:
         writer.add_image("samples/layout", color, step, dataformats="HWC")
+        writer.add_scalar("samples/ratio_mae", float(ratio_mae.item()), step)
 
 
 def main():
@@ -320,12 +361,34 @@ def main():
                 sqrt_one_minus_a = (1 - a).sqrt()
                 x0_pred = (noisy_layouts - sqrt_one_minus_a * noise_pred) / sqrt_a
                 probs = torch.softmax(x0_pred / args.ratio_temp, dim=1)
-                weighted = (probs * valid64).sum(dim=(2, 3))
-                denom = valid64.sum(dim=(2, 3)).clamp(min=1.0)
+
+                if args.ratio_pool is not None and int(args.ratio_pool) > 1:
+                    k = int(args.ratio_pool)
+                    probs_p = F.avg_pool2d(probs, kernel_size=k, stride=k)
+                    valid_p = F.avg_pool2d(valid64, kernel_size=k, stride=k)
+                else:
+                    probs_p = probs
+                    valid_p = valid64
+
+                weighted = (probs_p * valid_p).sum(dim=(2, 3))
+                denom = valid_p.sum(dim=(2, 3)).clamp(min=1.0)
                 r_hat = weighted / denom
                 ratio_loss = F.mse_loss(r_hat.float(), ratios.float(), reduction="mean")
+
+                tv_loss = torch.tensor(0.0, device=probs.device)
+                if args.lambda_tv is not None and float(args.lambda_tv) > 0:
+                    v = valid64
+                    vh = v[:, :, 1:, :] * v[:, :, :-1, :]
+                    vw = v[:, :, :, 1:] * v[:, :, :, :-1]
+
+                    dh = (probs[:, :, 1:, :] - probs[:, :, :-1, :]).abs()
+                    dw = (probs[:, :, :, 1:] - probs[:, :, :, :-1]).abs()
+
+                    tv_h = (dh * vh).sum() / vh.sum().clamp(min=1.0)
+                    tv_w = (dw * vw).sum() / vw.sum().clamp(min=1.0)
+                    tv_loss = tv_h + tv_w
                 denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-                loss = denoise_loss + args.lambda_ratio * ratio_loss
+                loss = denoise_loss + args.lambda_ratio * ratio_loss + float(args.lambda_tv) * tv_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -340,12 +403,13 @@ def main():
                 if global_step % args.logging_steps == 0:
                     accelerator.log(
                         {
-                            "train_loss": loss.detach().item(),
-                            "denoise_loss": denoise_loss.detach().item(),
-                            "ratio_loss": ratio_loss.detach().item(),
-                        },
-                        step=global_step,
-                    )
+	                            "train_loss": loss.detach().item(),
+	                            "denoise_loss": denoise_loss.detach().item(),
+	                            "ratio_loss": ratio_loss.detach().item(),
+	                            "tv_loss": tv_loss.detach().item(),
+	                        },
+	                        step=global_step,
+	                    )
 
                 if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -367,6 +431,9 @@ def main():
                             output_dir=args.output_dir,
                             step=global_step,
                             seed=args.sample_seed,
+                            ratio_pool=args.ratio_pool,
+                            ratio_temp=args.ratio_temp,
+                            viz_smooth=args.viz_smooth,
                         )
                         if was_training:
                             unet.train()
@@ -398,6 +465,11 @@ def main():
                     "num_train_timesteps": args.num_train_timesteps,
                     "base_channels": args.base_channels,
                     "layers_per_block": args.layers_per_block,
+                    "lambda_ratio": args.lambda_ratio,
+                    "ratio_temp": args.ratio_temp,
+                    "ratio_pool": args.ratio_pool,
+                    "lambda_tv": args.lambda_tv,
+                    "viz_smooth": args.viz_smooth,
                 },
                 handle,
                 indent=2,
