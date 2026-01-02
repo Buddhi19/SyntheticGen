@@ -104,6 +104,12 @@ def parse_args():
         default=0.0,
         help="Optional CFG rescale to reduce overexposure/artifacts.",
     )
+    parser.add_argument(
+        "--control_scale",
+        type=float,
+        default=2.0,
+        help="Scale factor for ControlNet residuals (like controlnet_conditioning_scale).",
+    )
     parser.add_argument("--use_karras_sigmas", action="store_true")
     parser.add_argument(
         "--sampler",
@@ -605,6 +611,10 @@ def main():
                 return_dict=False,
             )
             down_samples, mid_sample = film_gate(class_labels, down_samples, mid_sample)
+            if args.control_scale is not None and float(args.control_scale) != 1.0:
+                scale = float(args.control_scale)
+                down_samples = tuple(sample * scale for sample in down_samples)
+                mid_sample = mid_sample * scale
 
             noise_pred = unet(
                 latent_model_input,
