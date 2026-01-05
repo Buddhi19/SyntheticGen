@@ -9,6 +9,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from UrbanMamba.classification.models.vmamba import VSSM, LayerNorm2d, VSSBlock, Permute
 
+try:
+    from UrbanMamba.semanticsegmentation.models.sd_fusion import SDFusionBlock
+except ImportError:  # support alternate import contexts
+    try:
+        from .sd_fusion import SDFusionBlock  # type: ignore
+    except ImportError:
+        from sd_fusion import SDFusionBlock  # type: ignore
+
 
 class SemanticDecoder(nn.Module):
     def __init__(self, encoder_dims, channel_first, norm_layer, ssm_act_layer, mlp_act_layer, **kwargs):
@@ -66,18 +74,28 @@ class SemanticDecoder(nn.Module):
         self.smooth_layer_2_semantic = ResBlock(in_channels=128, out_channels=128, stride=1) 
         self.smooth_layer_1_semantic = ResBlock(in_channels=128, out_channels=128, stride=1) 
         self.smooth_layer_0_semantic = ResBlock(in_channels=128, out_channels=128, stride=1) 
+
+        # Optional Stable Diffusion feature fusion (FSD-FP).
+        self.use_sd_fusion = bool(kwargs.get("use_sd_fusion", False))
+        if self.use_sd_fusion:
+            self.sd_fuse_32 = SDFusionBlock(seg_channels=128, out_channels=128)
+            self.sd_fuse_16 = SDFusionBlock(seg_channels=128, out_channels=128)
+            self.sd_fuse_8 = SDFusionBlock(seg_channels=128, out_channels=128)
+            self.sd_fuse_8_p1 = SDFusionBlock(seg_channels=128, out_channels=128)
     
     def _upsample_add(self, x, y):
         _, _, H, W = y.size()
         return F.interpolate(x, size=(H, W), mode='bilinear') + y
 
-    def forward(self, features):
+    def forward(self, features, sd_feats=None):
         feat_1, feat_2, feat_3, feat_4 = features
 
         '''
             Stage I
         '''
         p4 = self.st_block_4_semantic(feat_4)
+        if self.use_sd_fusion and sd_feats is not None and "d32" in sd_feats:
+            p4 = self.sd_fuse_32(p4, sd_feats["d32"])
        
         '''
             Stage II
@@ -86,6 +104,8 @@ class SemanticDecoder(nn.Module):
         p3 = self._upsample_add(p4, p3)
         p3 = self.smooth_layer_3_semantic(p3)
         p3 = self.st_block_3_semantic(p3)
+        if self.use_sd_fusion and sd_feats is not None and "d16" in sd_feats:
+            p3 = self.sd_fuse_16(p3, sd_feats["d16"])
 
         '''
             Stage III
@@ -94,6 +114,8 @@ class SemanticDecoder(nn.Module):
         p2 = self._upsample_add(p3, p2)
         p2 = self.smooth_layer_2_semantic(p2)
         p2 = self.st_block_2_semantic(p2)
+        if self.use_sd_fusion and sd_feats is not None and "d8" in sd_feats:
+            p2 = self.sd_fuse_8(p2, sd_feats["d8"])
 
         '''
             Stage IV
@@ -103,6 +125,8 @@ class SemanticDecoder(nn.Module):
         p1 = self.smooth_layer_1_semantic(p1)
         p1 = self.st_block_1_semantic(p1)
         p1 = self.smooth_layer_0_semantic(p1)
+        if self.use_sd_fusion and sd_feats is not None and "d8" in sd_feats:
+            p1 = self.sd_fuse_8_p1(p1, sd_feats["d8"])
         return p1
 
    
