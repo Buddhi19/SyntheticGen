@@ -27,12 +27,14 @@ from diffusers.utils import check_min_version, is_wandb_available
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
+    from .config_utils import apply_config
     from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
+    from src.scripts.config_utils import apply_config
     from src.models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 
 
@@ -44,9 +46,48 @@ if is_wandb_available():
     import wandb  # noqa: F401
 
 
+def _tv_anisotropic(x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Anisotropic TV for 2D feature maps.
+
+    x: (B, C, H, W)
+    valid_mask: optional (B, 1, H, W) in {0,1} (or [0,1]) to gate valid pixels.
+    """
+    dx = x[..., 1:, :] - x[..., :-1, :]
+    dy = x[..., :, 1:] - x[..., :, :-1]
+    if valid_mask is None:
+        return dx.abs().mean() + dy.abs().mean()
+    vh = valid_mask[..., 1:, :] * valid_mask[..., :-1, :]
+    vw = valid_mask[..., :, 1:] * valid_mask[..., :, :-1]
+    tv_h = (dx.abs() * vh).sum() / vh.sum().clamp(min=1.0)
+    tv_w = (dy.abs() * vw).sum() / vw.sum().clamp(min=1.0)
+    return tv_h + tv_w
+
+
+def _tv_weight(step: int, max_steps: int, lambda_tv: float, warmup_steps: int) -> float:
+    if lambda_tv <= 0:
+        return 0.0
+    if warmup_steps is None or warmup_steps <= 0:
+        warmup_steps = max(1, int(0.15 * max_steps))
+    if step <= 0:
+        return 0.0
+    if step >= warmup_steps:
+        return float(lambda_tv)
+    return float(lambda_tv) * (float(step) / float(warmup_steps))
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a layout DDPM conditioned on class ratios.")
-    parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML/JSON config file; values act as argparse defaults.",
+    )
+    cfg_args, remaining = base_parser.parse_known_args()
+
+    parser = argparse.ArgumentParser(description="Train a layout DDPM conditioned on class ratios.", parents=[base_parser])
+    parser.add_argument("--data_root", type=str, default=None, help="Root folder for the dataset.")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -134,6 +175,12 @@ def parse_args():
         help="Weight for TV smoothness loss on probs. 0 disables.",
     )
     parser.add_argument(
+        "--tv_warmup_steps",
+        type=int,
+        default=-1,
+        help="Warmup steps for TV (<=0 means auto: 15%% of max_train_steps).",
+    )
+    parser.add_argument(
         "--viz_smooth",
         type=int,
         default=0,
@@ -152,7 +199,13 @@ def parse_args():
     )
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--local_rank", type=int, default=-1)
-    args = parser.parse_args()
+    if cfg_args.config:
+        apply_config(parser, cfg_args.config)
+    args = parser.parse_args(remaining)
+    args.config = cfg_args.config
+
+    if args.data_root is None:
+        parser.error("--data_root is required (pass it directly or via --config).")
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -501,23 +554,16 @@ def main():
                         prior_loss = (r_hat_rem * ((r_hat_rem + 1e-8).log() - (p0 + 1e-8).log())).sum(dim=1).mean()
 
                 tv_loss = torch.tensor(0.0, device=probs.device)
+                tv_w = 0.0
                 if args.lambda_tv is not None and float(args.lambda_tv) > 0:
-                    v = valid64
-                    vh = v[:, :, 1:, :] * v[:, :, :-1, :]
-                    vw = v[:, :, :, 1:] * v[:, :, :, :-1]
-
-                    dh = (probs[:, :, 1:, :] - probs[:, :, :-1, :]).abs()
-                    dw = (probs[:, :, :, 1:] - probs[:, :, :, :-1]).abs()
-
-                    tv_h = (dh * vh).sum() / vh.sum().clamp(min=1.0)
-                    tv_w = (dw * vw).sum() / vw.sum().clamp(min=1.0)
-                    tv_loss = tv_h + tv_w
+                    tv_loss = _tv_anisotropic(probs, valid_mask=valid64)
+                    tv_w = _tv_weight(global_step, args.max_train_steps, float(args.lambda_tv), int(args.tv_warmup_steps))
                 denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
                 loss = (
                     denoise_loss
                     + args.lambda_ratio * ratio_loss
                     + float(args.lambda_prior) * prior_loss
-                    + float(args.lambda_tv) * tv_loss
+                    + tv_w * tv_loss
                 )
 
                 accelerator.backward(loss)
@@ -538,6 +584,7 @@ def main():
 	                            "ratio_loss": ratio_loss.detach().item(),
                                 "prior_loss": prior_loss.detach().item(),
 	                            "tv_loss": tv_loss.detach().item(),
+                                "tv_w": float(tv_w),
 	                        },
 	                        step=global_step,
 	                    )
@@ -588,6 +635,9 @@ def main():
         with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as handle:
             json.dump(class_names, handle, indent=2)
         with open(os.path.join(args.output_dir, "training_config.json"), "w", encoding="utf-8") as handle:
+            tv_warmup_steps = int(args.tv_warmup_steps)
+            if tv_warmup_steps <= 0:
+                tv_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
             json.dump(
                 {
                     "dataset": args.dataset,
@@ -609,6 +659,7 @@ def main():
                     "ratio_temp": args.ratio_temp,
                     "ratio_pool": args.ratio_pool,
                     "lambda_tv": args.lambda_tv,
+                    "tv_warmup_steps": tv_warmup_steps,
                     "viz_smooth": args.viz_smooth,
                 },
                 handle,

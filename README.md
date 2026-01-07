@@ -55,6 +55,23 @@ Masks should be single-channel label maps (integer class ids) or paletted PNGs.
 
 ## Training
 
+## YAML configs
+
+All scripts accept `--config` pointing to a YAML/JSON file (keys match CLI arg names). Example configs live in `configs/`.
+
+```bash
+# Stage A (DDPM) on 2 GPUs (6,7)
+CUDA_VISIBLE_DEVICES=6,7 python3 -m accelerate.commands.launch --multi_gpu --num_processes 2 --main_process_port 29507 \
+  src/scripts/train_layout_ddpm.py --config configs/train_layout_ddpm_masked_sparse_80k.yaml
+
+# Ratio prior
+python src/scripts/compute_ratio_prior.py --config configs/compute_ratio_prior_loveda_train.yaml
+
+# Stage B (ControlNet)
+CUDA_VISIBLE_DEVICES=6,7 python3 -m accelerate.commands.launch --multi_gpu --num_processes 2 --main_process_port 29509 \
+  src/scripts/train_controlnet_ratio.py --config configs/train_controlnet_ratio_loveda_1024.yaml
+```
+
 Stage A (layout DDPM):
 
 ```bash
@@ -135,6 +152,8 @@ python src/scripts/sample_pair.py \
 Example (specific checkpoint + single-class ratio):
 
 ```bash
+CUDA_VISIBLE_DEVICES=7 python src/scripts/sample_pair.py --config configs/sample_pair_ckpt40000_building0.4.yaml
+
 CUDA_VISIBLE_DEVICES=7 python /data/inr/llm/DIFF_CD/Diffusor/SyntheticGen/src/scripts/sample_pair.py \
   --layout_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV2/layout_ddpm_export_80000 \
   --controlnet_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV2/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-40000 \

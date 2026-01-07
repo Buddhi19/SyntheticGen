@@ -28,6 +28,7 @@ from diffusers import (
 
 try:
     from .dataset_loveda import build_palette
+    from .config_utils import apply_config
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -41,6 +42,7 @@ except ImportError:  # direct execution
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import build_palette
+    from src.scripts.config_utils import apply_config
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -55,12 +57,21 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Sample layout and image pairs.")
-    parser.add_argument("--layout_ckpt", type=str, required=True, help="Layout DDPM checkpoint directory.")
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML/JSON config file; values act as argparse defaults.",
+    )
+    cfg_args, remaining = base_parser.parse_known_args()
+
+    parser = argparse.ArgumentParser(description="Sample layout and image pairs.", parents=[base_parser])
+    parser.add_argument("--layout_ckpt", type=str, default=None, help="Layout DDPM checkpoint directory.")
     parser.add_argument(
         "--controlnet_ckpt",
         type=str,
-        required=True,
+        default=None,
         help="ControlNet checkpoint directory (export dir or training checkpoint-XXXXX).",
     )
     parser.add_argument("--base_model", type=str, default=None, help="Base SD model path or ID.")
@@ -72,7 +83,7 @@ def parse_args():
         help="LoRA weight filename inside lora_path.",
     )
     parser.add_argument("--lora_scale", type=float, default=1.0, help="LoRA scale (0 disables; 1 full).")
-    parser.add_argument("--save_dir", type=str, required=True, help="Directory to save outputs.")
+    parser.add_argument("--save_dir", type=str, default=None, help="Directory to save outputs.")
     parser.add_argument(
         "--ratios",
         type=str,
@@ -149,7 +160,16 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--device", type=str, default="cuda")
-    return parser.parse_args()
+    if cfg_args.config:
+        apply_config(parser, cfg_args.config)
+    args = parser.parse_args(remaining)
+    args.config = cfg_args.config
+
+    missing = [name for name in ["layout_ckpt", "controlnet_ckpt", "save_dir"] if getattr(args, name) in (None, "")]
+    if missing:
+        parser.error(f"Missing required arguments: {', '.join('--' + x for x in missing)} (pass them directly or via --config).")
+
+    return args
 
 
 def resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:

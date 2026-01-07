@@ -32,6 +32,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
+    from .config_utils import apply_config
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -43,6 +44,7 @@ except ImportError:  # direct execution
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
+    from src.scripts.config_utils import apply_config
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -60,15 +62,24 @@ if is_wandb_available():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train ControlNet with layout + ratio conditioning.")
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML/JSON config file; values act as argparse defaults.",
+    )
+    cfg_args, remaining = base_parser.parse_known_args()
+
+    parser = argparse.ArgumentParser(description="Train ControlNet with layout + ratio conditioning.", parents=[base_parser])
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        required=True,
+        default=None,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument("--output_dir", type=str, default="outputsV2/controlnet_ratio")
-    parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
+    parser.add_argument("--data_root", type=str, default=None, help="Root folder for the dataset.")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -191,7 +202,20 @@ def parse_args():
     )
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--local_rank", type=int, default=-1)
-    args = parser.parse_args()
+    if cfg_args.config:
+        apply_config(parser, cfg_args.config)
+    args = parser.parse_args(remaining)
+    args.config = cfg_args.config
+
+    missing = [
+        name
+        for name in ["pretrained_model_name_or_path", "data_root"]
+        if getattr(args, name) in (None, "")
+    ]
+    if missing:
+        parser.error(
+            f"Missing required arguments: {', '.join('--' + x for x in missing)} (pass them directly or via --config)."
+        )
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:

@@ -13,16 +13,27 @@ from torch.utils.data import DataLoader
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from .config_utils import apply_config
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.scripts.config_utils import apply_config
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Compute a global class-ratio prior (mean ratios over dataset).")
-    parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML/JSON config file; values act as argparse defaults.",
+    )
+    cfg_args, remaining = base_parser.parse_known_args()
+
+    parser = argparse.ArgumentParser(description="Compute a global class-ratio prior (mean ratios over dataset).", parents=[base_parser])
+    parser.add_argument("--data_root", type=str, default=None, help="Root folder for the dataset.")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -39,7 +50,14 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--output_path", type=str, default="outputsV2/ratio_prior.json")
-    return parser.parse_args()
+    if cfg_args.config:
+        apply_config(parser, cfg_args.config)
+    args = parser.parse_args(remaining)
+    args.config = cfg_args.config
+
+    if args.data_root is None:
+        parser.error("--data_root is required (pass it directly or via --config).")
+    return args
 
 
 def _resolve_dataset(args, num_classes: int):
@@ -100,4 +118,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
