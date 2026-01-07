@@ -98,6 +98,31 @@ python src/scripts/sample_pair.py \
   --save_dir outputs/sample_pair
 ```
 
+Example (specific checkpoint + single-class ratio):
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python /data/inr/llm/DIFF_CD/Diffusor/SyntheticGen/src/scripts/sample_pair.py \
+  --layout_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV2/layout_ddpm_export_80000 \
+  --controlnet_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV2/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-40000 \
+  --base_model /home/nvidia/.cache/huggingface/hub/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14 \
+  --lora_path /data/inr/llm/DIFF_CD/Diffusor/outputsV2/lora_loveda_sd15_r8/checkpoint-29000 \
+  --lora_weight_name pytorch_lora_weights.safetensors \
+  --lora_scale 1.0 \
+  --save_dir /data/inr/llm/DIFF_CD/Diffusor/outputsV2/results_generator/gpu7 \
+  --ratios "building:0.4" \
+  --prompt "a high-resolution satellite image" \
+  --image_size 1024 \
+  --num_inference_steps_layout 50 \
+  --num_inference_steps_image 30 \
+  --guidance_scale 1.0 \
+  --guidance_rescale 0.0 \
+  --control_scale 1.0 \
+  --seed 40000 \
+  --dtype fp16 \
+  --device cuda:0 \
+  --sampler ddim
+```
+
 Img2img with a provided mask:
 
 ```bash
