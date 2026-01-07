@@ -35,6 +35,7 @@ try:
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
+        build_ratio_projector_from_state_dict,
         infer_time_embed_dim_from_config,
     )
 except ImportError:  # direct execution
@@ -45,6 +46,7 @@ except ImportError:  # direct execution
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
+        build_ratio_projector_from_state_dict,
         infer_time_embed_dim_from_config,
     )
 
@@ -302,7 +304,11 @@ def _sample_layout_from_ratios(
     num_classes = int(layout_unet.config.in_channels)
     layout_size = int(layout_unet.config.sample_size)
 
-    ratio_emb = layout_ratio_projector(ratios.unsqueeze(0)).to(dtype=output_dtype)
+    if getattr(layout_ratio_projector, "input_dim", num_classes) == num_classes:
+        ratio_emb = layout_ratio_projector(ratios.unsqueeze(0)).to(dtype=output_dtype)
+    else:
+        known_mask = torch.ones_like(ratios)
+        ratio_emb = layout_ratio_projector(ratios.unsqueeze(0), known_mask.unsqueeze(0)).to(dtype=output_dtype)
     latents = torch.randn(
         (1, num_classes, layout_size, layout_size),
         generator=generator,
@@ -647,11 +653,14 @@ def main():
                 f"{layout_unet.config.in_channels} (ckpt) vs {num_classes} (dataset)"
             )
         time_embed_dim_layout = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
-        layout_ratio_projector = RatioProjector(num_classes, time_embed_dim_layout)
         state_path = layout_ckpt / "ratio_projector.bin"
         if not state_path.is_file():
             raise FileNotFoundError(f"Layout ratio_projector not found at {state_path}")
-        layout_ratio_projector.load_state_dict(_safe_torch_load(state_path, map_location="cpu"))
+        layout_ratio_state = _safe_torch_load(state_path, map_location="cpu")
+        layout_ratio_projector = build_ratio_projector_from_state_dict(
+            layout_ratio_state, num_classes=num_classes, embed_dim=time_embed_dim_layout
+        )
+        layout_ratio_projector.load_state_dict(layout_ratio_state)
         layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
         layout_unet.to(accelerator.device, dtype=weight_dtype)

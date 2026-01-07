@@ -1,6 +1,9 @@
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+
 import torch
 from torch import nn
-from typing import List, Tuple
 
 
 def infer_time_embed_dim_from_config(block_out_channels) -> int:
@@ -10,17 +13,71 @@ def infer_time_embed_dim_from_config(block_out_channels) -> int:
 
 
 class RatioProjector(nn.Module):
-    def __init__(self, num_classes: int, embed_dim: int, hidden_mult: int = 4) -> None:
+    def __init__(
+        self,
+        num_classes: int,
+        embed_dim: int,
+        hidden_mult: int = 4,
+        *,
+        input_dim: Optional[int] = None,
+        hidden_dim: Optional[int] = None,
+        layer_norm: bool = False,
+    ) -> None:
         super().__init__()
-        hidden_dim = max(1, hidden_mult * num_classes)
-        self.net = nn.Sequential(
-            nn.Linear(num_classes, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, embed_dim),
-        )
+        self.num_classes = int(num_classes)
+        self.embed_dim = int(embed_dim)
+        self.input_dim = int(input_dim) if input_dim is not None else self.num_classes
+        self.hidden_dim = int(hidden_dim) if hidden_dim is not None else max(1, int(hidden_mult) * self.num_classes)
 
-    def forward(self, ratios: torch.Tensor) -> torch.Tensor:
-        return self.net(ratios)
+        layers = [nn.Linear(self.input_dim, self.hidden_dim)]
+        if layer_norm:
+            layers.append(nn.LayerNorm(self.hidden_dim))
+        layers.append(nn.SiLU())
+        layers.append(nn.Linear(self.hidden_dim, self.embed_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        ratios: torch.Tensor,
+        known_mask: Optional[torch.Tensor] = None,
+        *,
+        known_sum: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if known_mask is None:
+            return self.net(ratios)
+
+        if ratios.shape[-1] != self.num_classes or known_mask.shape[-1] != self.num_classes:
+            raise ValueError(
+                f"Expected ratios/mask last dim == {self.num_classes}, "
+                f"got ratios={tuple(ratios.shape)} mask={tuple(known_mask.shape)}."
+            )
+
+        include_known_sum = self.input_dim == (2 * self.num_classes + 1)
+        if include_known_sum and known_sum is None:
+            known_sum = (ratios * known_mask).sum(dim=-1, keepdim=True)
+        feat = torch.cat([ratios, known_mask], dim=-1)
+        if include_known_sum:
+            feat = torch.cat([feat, known_sum], dim=-1)
+        return self.net(feat)
+
+
+def build_ratio_projector_from_state_dict(
+    state_dict: Dict[str, torch.Tensor], num_classes: int, embed_dim: int
+) -> RatioProjector:
+    """Instantiate a RatioProjector that matches a saved state dict (supports old/new input dims)."""
+    w0 = state_dict.get("net.0.weight")
+    if w0 is None or not hasattr(w0, "shape") or len(w0.shape) != 2:
+        raise ValueError("Invalid ratio projector state dict: missing net.0.weight.")
+    hidden_dim = int(w0.shape[0])
+    input_dim = int(w0.shape[1])
+    layer_norm = "net.1.weight" in state_dict and state_dict["net.1.weight"].numel() == hidden_dim
+    return RatioProjector(
+        num_classes=num_classes,
+        embed_dim=embed_dim,
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        layer_norm=layer_norm,
+    )
 
 
 class ResidualFiLMGate(nn.Module):

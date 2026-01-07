@@ -68,6 +68,29 @@ python src/scripts/train_layout_ddpm.py \
   --ratio_temp 1.0
 ```
 
+Optional: train Stage A with sparse (partial) ratio conditioning:
+
+```bash
+python src/scripts/compute_ratio_prior.py \
+  --data_root /path/to/loveda \
+  --dataset loveda \
+  --image_size 1024 \
+  --output_path outputsV2/ratio_prior.json
+
+python src/scripts/train_layout_ddpm.py \
+  --data_root /path/to/loveda \
+  --dataset loveda \
+  --output_dir outputs/layout_ddpm_masked \
+  --image_size 1024 \
+  --layout_size 256 \
+  --ratio_conditioning masked \
+  --p_keep 0.3 \
+  --known_count_max 3 \
+  --lambda_ratio 1.0 \
+  --lambda_prior 0.1 \
+  --ratio_prior_json outputsV2/ratio_prior.json
+```
+
 Stage B (ControlNet + FiLM ratio conditioning):
 
 ```bash
@@ -96,6 +119,17 @@ python src/scripts/sample_pair.py \
   --base_model /path/to/sd-v1-5 \
   --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
   --save_dir outputs/sample_pair
+```
+
+Sparse ratio constraints (works with Stage A checkpoints trained with `--ratio_conditioning masked`):
+
+```bash
+python src/scripts/sample_pair.py \
+  --layout_ckpt outputs/layout_ddpm_masked \
+  --controlnet_ckpt outputs/controlnet_ratio \
+  --base_model /path/to/sd-v1-5 \
+  --ratios "water:0.15,agriculture:0.10" \
+  --save_dir outputs/sample_pair_sparse
 ```
 
 Example (specific checkpoint + single-class ratio):

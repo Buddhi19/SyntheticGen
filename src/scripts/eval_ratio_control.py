@@ -18,13 +18,13 @@ from diffusers import DDPMScheduler, UNet2DModel
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-    from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
+    from ..models.ratio_conditioning import RatioProjector, build_ratio_projector_from_state_dict, infer_time_embed_dim_from_config
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
-    from src.models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
+    from src.models.ratio_conditioning import RatioProjector, build_ratio_projector_from_state_dict, infer_time_embed_dim_from_config
 
 
 logger = logging.getLogger(__name__)
@@ -170,8 +170,9 @@ def main():
     class_names, _ = load_class_names(args.class_names_json, args.num_classes or num_classes, args.dataset)
     layout_size = layout_unet.config.sample_size
     time_embed_dim = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
-    ratio_projector = RatioProjector(num_classes, time_embed_dim)
-    ratio_projector.load_state_dict(_safe_torch_load(layout_ckpt / "ratio_projector.bin", map_location="cpu"))
+    ratio_state = _safe_torch_load(layout_ckpt / "ratio_projector.bin", map_location="cpu")
+    ratio_projector = build_ratio_projector_from_state_dict(ratio_state, num_classes=num_classes, embed_dim=time_embed_dim)
+    ratio_projector.load_state_dict(ratio_state)
     scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
     dataset = _resolve_dataset(args, num_classes, layout_size)
@@ -188,7 +189,11 @@ def main():
     errors = []
     for ratios, valid in targets:
         ratios = ratios.to(device=device, dtype=torch.float32)
-        ratio_emb = ratio_projector(ratios.unsqueeze(0))
+        if getattr(ratio_projector, "input_dim", num_classes) == num_classes:
+            ratio_emb = ratio_projector(ratios.unsqueeze(0))
+        else:
+            known_mask = torch.ones_like(ratios)
+            ratio_emb = ratio_projector(ratios.unsqueeze(0), known_mask.unsqueeze(0))
         latents = torch.randn(
             (1, num_classes, layout_size, layout_size),
             generator=generator,

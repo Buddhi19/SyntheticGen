@@ -32,6 +32,7 @@ try:
         PerChannelResidualFiLMGate,
         RatioProjector,
         ResidualFiLMGate,
+        build_ratio_projector_from_state_dict,
         infer_time_embed_dim_from_config,
     )
     from ..models.segmentation import SimpleSegNet
@@ -44,6 +45,7 @@ except ImportError:  # direct execution
         PerChannelResidualFiLMGate,
         RatioProjector,
         ResidualFiLMGate,
+        build_ratio_projector_from_state_dict,
         infer_time_embed_dim_from_config,
     )
     from src.models.segmentation import SimpleSegNet
@@ -75,13 +77,13 @@ def parse_args():
         "--ratios",
         type=str,
         default=None,
-        help="Ratios as CSV or name:value pairs (missing classes filled randomly).",
+        help="Ratios as CSV or name:value pairs (supports partial specs).",
     )
     parser.add_argument(
         "--ratios_json",
         type=str,
         default=None,
-        help="JSON file with ratios list/dict (missing classes filled randomly).",
+        help="JSON file with ratios list/dict (supports partial specs).",
     )
     parser.add_argument("--class_names_json", type=str, default=None, help="Optional class names JSON.")
     parser.add_argument("--prompt", type=str, default=None, help="Prompt for image sampling.")
@@ -208,74 +210,102 @@ def _load_class_names(args, layout_ckpt: Path, controlnet_ckpt: Path, num_classe
     return [f"class_{i}" for i in range(num_classes)]
 
 
-def _parse_ratios(
+def _parse_ratio_constraints(
     ratios_str: Optional[str],
     ratios_json: Optional[str],
     num_classes: int,
     class_names: List[str],
-    seed: Optional[int] = None,
-) -> torch.Tensor:
-    def _fill_missing(values: List[Optional[float]]) -> List[float]:
-        missing = [i for i, v in enumerate(values) if v is None]
-        if not missing:
-            return [float(v) for v in values]
-        specified = [float(v) for v in values if v is not None]
-        specified_sum = float(sum(specified))
-        if specified_sum > 1.0:
-            raise ValueError("Specified ratios sum to more than 1.0.")
-        remaining = 1.0 - specified_sum
-        if remaining <= 0:
-            for idx in missing:
-                values[idx] = 0.0
-            return [float(v) for v in values]
-        generator = None
-        if seed is not None:
-            generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        rand = torch.rand(len(missing), generator=generator)
-        rand = rand / rand.sum()
-        for idx, val in zip(missing, (rand * remaining).tolist()):
-            values[idx] = float(val)
-        return [float(v) for v in values]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Returns (ratio_values, known_mask), both float32 tensors of shape (K,)."""
+    name_to_idx = {str(name).strip().lower(): i for i, name in enumerate(class_names)}
+
+    values = [0.0] * num_classes
+    known = [0.0] * num_classes
 
     if ratios_json:
         data = _load_json(Path(ratios_json))
         if isinstance(data, list):
             if len(data) > num_classes:
                 raise ValueError(f"Expected at most {num_classes} ratios, got {len(data)}.")
-            values = [float(x) for x in data] + [None] * (num_classes - len(data))
+            for i, x in enumerate(data):
+                values[i] = float(x)
+                known[i] = 1.0
         elif isinstance(data, dict):
-            values = [None] * num_classes
             for key, value in data.items():
-                idx = int(key) if str(key).isdigit() else class_names.index(key)
+                key_str = str(key).strip()
+                idx = int(key_str) if key_str.isdigit() else name_to_idx[key_str.lower()]
                 values[idx] = float(value)
+                known[idx] = 1.0
         else:
             raise ValueError("ratios_json must be a list or dict.")
     elif ratios_str:
+        ratios_str = str(ratios_str)
         if ":" in ratios_str:
-            values = [None] * num_classes
             for chunk in ratios_str.split(","):
-                name, value = chunk.split(":")
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                name, value = chunk.split(":", maxsplit=1)
                 name = name.strip()
-                idx = int(name) if name.isdigit() else class_names.index(name)
+                idx = int(name) if name.isdigit() else name_to_idx[name.lower()]
                 values[idx] = float(value)
+                known[idx] = 1.0
         else:
             raw = [x for x in ratios_str.split(",") if x.strip() != ""]
             if len(raw) > num_classes:
                 raise ValueError(f"Expected at most {num_classes} ratios, got {len(raw)}.")
-            values = [float(x) for x in raw] + [None] * (num_classes - len(raw))
+            for i, x in enumerate(raw):
+                values[i] = float(x)
+                known[i] = 1.0
     else:
         raise ValueError("Provide --ratios or --ratios_json.")
 
-    for v in values:
-        if v is not None and float(v) < 0:
-            raise ValueError("Ratios must be non-negative.")
-    values_filled = _fill_missing(values)
-    ratios = torch.tensor(values_filled, dtype=torch.float32)
-    ratios = torch.clamp(ratios, min=0)
-    total = ratios.sum()
+    values_t = torch.tensor(values, dtype=torch.float32)
+    known_t = torch.tensor(known, dtype=torch.float32)
+    if torch.any(values_t < 0):
+        raise ValueError("Ratios must be non-negative.")
+    if known_t.sum().item() <= 0:
+        raise ValueError("At least one ratio must be specified.")
+    known_sum = float((values_t * known_t).sum().item())
+    if known_t.sum().item() < num_classes and known_sum > 1.0 + 1e-6:
+        raise ValueError("Specified ratios sum to more than 1.0.")
+    return values_t, known_t
+
+
+def _impute_full_ratios(ratio_values: torch.Tensor, known_mask: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
+    """Returns a full ratio vector of shape (K,) that sums to 1 (fills unknowns randomly)."""
+    ratio_values = ratio_values.detach().cpu().to(dtype=torch.float32)
+    known_mask = known_mask.detach().cpu().to(dtype=torch.float32)
+    if ratio_values.ndim != 1 or known_mask.ndim != 1:
+        raise ValueError("ratio_values/known_mask must be 1D tensors.")
+    if ratio_values.shape[0] != known_mask.shape[0]:
+        raise ValueError("ratio_values and known_mask must have the same length.")
+
+    if torch.all(known_mask > 0):
+        total = ratio_values.sum()
+        if total <= 0:
+            raise ValueError("Ratios must sum to a positive value.")
+        return ratio_values / total
+
+    known_sum = (ratio_values * known_mask).sum()
+    if known_sum > 1.0 + 1e-6:
+        raise ValueError("Specified ratios sum to more than 1.0.")
+    remaining = float(max(0.0, 1.0 - float(known_sum.item())))
+
+    full = ratio_values * known_mask
+    missing = torch.nonzero(known_mask <= 0, as_tuple=False).flatten()
+    if missing.numel() > 0 and remaining > 0:
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        rand = torch.rand(int(missing.numel()), generator=generator)
+        rand = rand / rand.sum().clamp(min=1e-8)
+        full[missing] = rand * remaining
+
+    total = full.sum()
     if total <= 0:
         raise ValueError("Ratios must sum to a positive value.")
-    return ratios / total
+    return full / total
 
 
 def _vae_decode(vae: AutoencoderKL, latents: torch.Tensor) -> torch.Tensor:
@@ -313,11 +343,12 @@ def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray
 
 
 def _load_ratio_projector(checkpoint_dir: Path, num_classes: int, embed_dim: int) -> RatioProjector:
-    projector = RatioProjector(num_classes, embed_dim)
     state_path = checkpoint_dir / "ratio_projector.bin"
     if not state_path.is_file():
         raise FileNotFoundError(f"ratio_projector not found at {state_path}")
-    projector.load_state_dict(_load_state_dict(state_path))
+    state = _load_state_dict(state_path)
+    projector = build_ratio_projector_from_state_dict(state, num_classes=num_classes, embed_dim=embed_dim)
+    projector.load_state_dict(state)
     return projector
 
 
@@ -451,7 +482,8 @@ def main():
     layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
     class_names = _load_class_names(args, layout_ckpt, controlnet_root, num_classes)
-    ratios = _parse_ratios(args.ratios, args.ratios_json, num_classes, class_names, seed=args.seed)
+    ratios_requested, ratios_known_mask = _parse_ratio_constraints(args.ratios, args.ratios_json, num_classes, class_names)
+    ratios_full = _impute_full_ratios(ratios_requested, ratios_known_mask, seed=args.seed)
 
     if args.seed is not None:
         generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -477,8 +509,24 @@ def main():
         init_mask_tensor = _resize_mask(seg_mask, layout_size)
         mask_format = "indexed"
 
-    ratios_device = ratios.to(device=device, dtype=weight_dtype)
-    ratio_emb_layout = layout_ratio_projector(ratios_device.unsqueeze(0)).to(dtype=weight_dtype)
+    if getattr(layout_ratio_projector, "input_dim", num_classes) == num_classes:
+        ratios_layout = ratios_full
+        ratios_layout_mask = torch.ones_like(ratios_full)
+        ratios_layout_device = ratios_layout.to(device=device, dtype=weight_dtype)
+        ratios_layout_mask_device = ratios_layout_mask.to(device=device, dtype=weight_dtype)
+        ratio_emb_layout = layout_ratio_projector(ratios_layout_device.unsqueeze(0)).to(dtype=weight_dtype)
+    else:
+        if torch.all(ratios_known_mask > 0):
+            ratios_layout = ratios_full
+            ratios_layout_mask = torch.ones_like(ratios_full)
+        else:
+            ratios_layout = ratios_requested
+            ratios_layout_mask = ratios_known_mask
+        ratios_layout_device = ratios_layout.to(device=device, dtype=weight_dtype)
+        ratios_layout_mask_device = ratios_layout_mask.to(device=device, dtype=weight_dtype)
+        ratio_emb_layout = layout_ratio_projector(ratios_layout_device.unsqueeze(0), ratios_layout_mask_device.unsqueeze(0)).to(
+            dtype=weight_dtype
+        )
     layout_scheduler.set_timesteps(args.num_inference_steps_layout, device=device)
     if init_mask_tensor is not None:
         init_mask = init_mask_tensor.to(device)
@@ -519,7 +567,7 @@ def main():
                 x0_pred = (layout_latents - sqrt_one_minus * noise_pred) / sqrt_alpha
                 probs = torch.softmax(x0_pred / args.hist_guidance_temp, dim=1)
                 r_hat = probs.mean(dim=(2, 3))
-                delta = (ratios_device - r_hat).view(1, num_classes, 1, 1)
+                delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
             layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
             if args.hist_guidance_scale > 0:
                 layout_latents = layout_latents + args.hist_guidance_scale * delta
@@ -529,6 +577,8 @@ def main():
     layout_onehot_512 = F.interpolate(layout_onehot_64, size=(args.image_size, args.image_size), mode="nearest")
     layout_ids_512 = F.interpolate(layout_ids_64.unsqueeze(1).float(), size=(args.image_size, args.image_size), mode="nearest")
     layout_ids_512 = layout_ids_512.squeeze(1).long()
+    ratios_generated = layout_onehot_64.mean(dim=(2, 3))[0].detach()
+    ratios_image_device = ratios_generated.to(device=device, dtype=weight_dtype)
 
     training_config = _load_json(controlnet_root / "training_config.json") or {}
     base_model = args.base_model or training_config.get("base_model")
@@ -557,9 +607,10 @@ def main():
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
     if controlnet_state_ckpt is not None:
-        ratio_projector = RatioProjector(num_classes, time_embed_dim)
         ratio_state_path = controlnet_state_ckpt / "model_1.safetensors"
-        ratio_projector.load_state_dict(_load_state_dict(ratio_state_path))
+        ratio_state = _load_state_dict(ratio_state_path)
+        ratio_projector = build_ratio_projector_from_state_dict(ratio_state, num_classes=num_classes, embed_dim=time_embed_dim)
+        ratio_projector.load_state_dict(ratio_state)
         gate_state_path = controlnet_state_ckpt / "model_2.safetensors"
         gate_state = _load_state_dict(gate_state_path)
     else:
@@ -628,7 +679,7 @@ def main():
         uncond_embeds = text_encoder(uncond_inputs.input_ids.to(device))[0]
     uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
 
-    ratio_emb = ratio_projector(ratios_device.unsqueeze(0)).to(dtype=weight_dtype)
+    ratio_emb = ratio_projector(ratios_image_device.unsqueeze(0)).to(dtype=weight_dtype)
     layout_cond = layout_onehot_512.to(device=device, dtype=weight_dtype)
     layout_uncond = torch.zeros_like(layout_cond)
     ratio_uncond = torch.zeros_like(ratio_emb)
@@ -730,7 +781,11 @@ def main():
 
     metadata = {
         "prompt": prompt,
-        "ratios": ratios.tolist(),
+        "ratios": [float(x) for x in ratios_layout.detach().cpu().tolist()],
+        "ratios_known_mask": [float(x) for x in ratios_layout_mask.detach().cpu().tolist()],
+        "ratios_requested": [float(x) for x in ratios_requested.detach().cpu().tolist()],
+        "ratios_requested_mask": [float(x) for x in ratios_known_mask.detach().cpu().tolist()],
+        "ratios_generated": [float(x) for x in ratios_generated.detach().cpu().tolist()],
         "class_names": class_names,
         "layout_path": str(layout_path),
         "layout_color_path": str(layout_color_path),
