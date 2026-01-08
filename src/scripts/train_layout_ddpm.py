@@ -204,6 +204,18 @@ def parse_args():
         help="Conditioning type for ratios. Use 'masked' to train with partial ratio constraints.",
     )
     parser.add_argument(
+        "--ratio_known_weight",
+        type=float,
+        default=1.0,
+        help="When --ratio_conditioning=masked, weight for known ratios in ratio loss (higher = enforce known more).",
+    )
+    parser.add_argument(
+        "--ratio_unknown_weight",
+        type=float,
+        default=0.0,
+        help="When --ratio_conditioning=masked, weight for unknown ratios in ratio loss (0 disables).",
+    )
+    parser.add_argument(
         "--p_keep",
         type=float,
         default=1.0,
@@ -427,6 +439,8 @@ def main():
             raise ValueError(f"--known_count_min must be in [1, {num_classes}].")
         if int(args.known_count_max) > 0 and int(args.known_count_max) < int(args.known_count_min):
             raise ValueError("--known_count_max must be 0 or >= --known_count_min.")
+        if float(args.ratio_known_weight) < 0 or float(args.ratio_unknown_weight) < 0:
+            raise ValueError("--ratio_known_weight/--ratio_unknown_weight must be >= 0.")
 
     train_dataset = _resolve_dataset(args, num_classes)
     ratio_prior = None
@@ -633,17 +647,21 @@ def main():
                 r_hat = weighted / denom
                 if known_mask is None:
                     ratio_loss = F.mse_loss(r_hat.float(), ratios_true.float(), reduction="mean")
+                    ratio_loss_known = ratio_loss.detach()
+                    ratio_loss_unknown = torch.tensor(0.0, device=r_hat.device)
                     prior_loss = torch.tensor(0.0, device=r_hat.device)
                 else:
                     mask_f = known_mask.to(dtype=r_hat.dtype)
+                    unknown_f = (1.0 - mask_f).clamp(min=0.0, max=1.0)
                     diff2 = (r_hat - ratios_true).float().pow(2)
-                    ratio_loss = (diff2 * mask_f.float()).sum() / mask_f.sum().clamp(min=1.0)
+                    ratio_loss_known = (diff2 * mask_f.float()).sum() / mask_f.sum().clamp(min=1.0)
+                    ratio_loss_unknown = (diff2 * unknown_f.float()).sum() / unknown_f.sum().clamp(min=1.0)
+                    ratio_loss = float(args.ratio_known_weight) * ratio_loss_known + float(args.ratio_unknown_weight) * ratio_loss_unknown
                     prior_loss = torch.tensor(0.0, device=r_hat.device)
                     if ratio_prior is not None and args.lambda_prior is not None and float(args.lambda_prior) > 0:
-                        unknown = (1.0 - mask_f).clamp(min=0.0, max=1.0)
-                        r_hat_rem = r_hat.float() * unknown.float()
+                        r_hat_rem = r_hat.float() * unknown_f.float()
                         r_hat_rem = r_hat_rem / r_hat_rem.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                        p0 = ratio_prior.to(device=r_hat.device, dtype=torch.float32).unsqueeze(0) * unknown.float()
+                        p0 = ratio_prior.to(device=r_hat.device, dtype=torch.float32).unsqueeze(0) * unknown_f.float()
                         p0 = p0 / p0.sum(dim=1, keepdim=True).clamp(min=1e-8)
                         prior_loss = (r_hat_rem * ((r_hat_rem + 1e-8).log() - (p0 + 1e-8).log())).sum(dim=1).mean()
 
@@ -677,6 +695,10 @@ def main():
 	                            "train_loss": loss.detach().item(),
 	                            "denoise_loss": denoise_loss.detach().item(),
 	                            "ratio_loss": ratio_loss.detach().item(),
+                                "ratio_loss_known": ratio_loss_known.detach().item(),
+                                "ratio_loss_unknown": ratio_loss_unknown.detach().item(),
+                                "ratio_known_w": float(args.ratio_known_weight),
+                                "ratio_unknown_w": float(args.ratio_unknown_weight),
                                 "prior_loss": prior_loss.detach().item(),
 	                            "tv_loss": tv_loss.detach().item(),
                                 "tv_w": float(tv_w),
@@ -753,6 +775,8 @@ def main():
                     "p_keep": args.p_keep,
                     "known_count_min": args.known_count_min,
                     "known_count_max": args.known_count_max,
+                    "ratio_known_weight": args.ratio_known_weight,
+                    "ratio_unknown_weight": args.ratio_unknown_weight,
                     "lambda_prior": args.lambda_prior,
                     "ratio_prior_json": args.ratio_prior_json,
                     "ratio_projector_input_dim": getattr(unwrapped_ratio, "input_dim", num_classes),
