@@ -283,6 +283,19 @@ def _set_lora_lr(optimizer, lr_scheduler, group_index: int, lr: float) -> None:
         lr_scheduler.base_lrs[group_index] = lr
 
 
+def _sync_lora_grads(accelerator: Accelerator, lora_params) -> None:
+    if not lora_params:
+        return
+    if accelerator.num_processes <= 1:
+        return
+    if not accelerator.sync_gradients:
+        return
+    for param in lora_params:
+        if param.requires_grad and param.grad is not None:
+            reduced = accelerator.reduce(param.grad, reduction="mean")
+            param.grad.copy_(reduced)
+
+
 def _get_tb_writer(accelerator: Accelerator):
     try:
         tracker = accelerator.get_tracker("tensorboard")
@@ -697,6 +710,15 @@ def main():
     first_epoch = 0
     if args.resume_from_checkpoint:
         accelerator.load_state(args.resume_from_checkpoint)
+        resume_lora_dir = os.path.join(args.resume_from_checkpoint, "unet_lora")
+        if os.path.isdir(resume_lora_dir):
+            unet.load_attn_procs(resume_lora_dir, weight_name=args.lora_weight_name)
+            logger.info("Loaded resumed UNet LoRA from %s (%s)", resume_lora_dir, args.lora_weight_name)
+            unet_lora_params = _get_unet_lora_parameters(unet)
+            for param in unet_lora_params:
+                param.requires_grad_(False)
+            if lora_group_index is not None:
+                optimizer.param_groups[lora_group_index]["params"] = unet_lora_params
         if os.path.basename(args.resume_from_checkpoint).startswith("checkpoint-"):
             global_step = int(os.path.basename(args.resume_from_checkpoint).split("-")[1])
             first_epoch = global_step // num_update_steps_per_epoch
@@ -718,10 +740,12 @@ def main():
 
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+    # Train with LoRA scale = 1.0 (always); use args.lora_scale only for sampling/logging.
     lora_scale = args.lora_scale if args.lora_scale is not None else 1.0
-    lora_cross_kwargs = None
+    lora_cross_kwargs_train = None
+    lora_cross_kwargs_sample = None
     if args.lora_path is not None and float(lora_scale) != 1.0:
-        lora_cross_kwargs = {"scale": float(lora_scale)}
+        lora_cross_kwargs_sample = {"scale": float(lora_scale)}
 
     for epoch in range(first_epoch, args.num_train_epochs):
         controlnet.train()
@@ -793,7 +817,7 @@ def main():
                     class_labels=ratio_emb,
                     down_block_additional_residuals=down_samples,
                     mid_block_additional_residual=mid_sample,
-                    cross_attention_kwargs=lora_cross_kwargs,
+                    cross_attention_kwargs=lora_cross_kwargs_train,
                 ).sample
 
                 if args.snr_gamma and args.snr_gamma > 0:
@@ -813,11 +837,16 @@ def main():
                     loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
+
+                # Ensure LoRA grads are synchronized across GPUs when LoRA is trainable.
+                if unet_lora_params and any(param.requires_grad for param in unet_lora_params):
+                    _sync_lora_grads(accelerator, unet_lora_params)
+
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()),
-                        args.max_grad_norm,
-                    )
+                    clip_groups = [controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()]
+                    if unet_lora_params and any(param.requires_grad for param in unet_lora_params):
+                        clip_groups.append(unet_lora_params)
+                    accelerator.clip_grad_norm_(chain(*clip_groups), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -850,6 +879,10 @@ def main():
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
+                        if unet_lora_params:
+                            lora_ckpt_dir = os.path.join(save_path, "unet_lora")
+                            os.makedirs(lora_ckpt_dir, exist_ok=True)
+                            unet.save_attn_procs(lora_ckpt_dir, weight_name=args.lora_weight_name)
                         if layout_sampler is not None:
                             ratios_sample = _sample_random_ratios_dirichlet(
                                 num_classes=num_classes,
@@ -946,6 +979,10 @@ def main():
         unwrapped_controlnet.save_pretrained(os.path.join(args.output_dir, "controlnet"))
         torch.save(unwrapped_ratio.state_dict(), os.path.join(args.output_dir, "ratio_projector.bin"))
         torch.save(unwrapped_gate.state_dict(), os.path.join(args.output_dir, "film_gate.bin"))
+        if unet_lora_params:
+            final_lora_dir = os.path.join(args.output_dir, "unet_lora")
+            os.makedirs(final_lora_dir, exist_ok=True)
+            unet.save_attn_procs(final_lora_dir, weight_name=args.lora_weight_name)
         with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as handle:
             json.dump(class_names, handle, indent=2)
         with open(os.path.join(args.output_dir, "training_config.json"), "w", encoding="utf-8") as handle:

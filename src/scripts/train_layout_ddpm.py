@@ -76,6 +76,73 @@ def _tv_weight(step: int, max_steps: int, lambda_tv: float, warmup_steps: int) -
     return float(lambda_tv) * (float(step) / float(warmup_steps))
 
 
+def _ramp_weight(step: int, max_steps: int, target: float) -> float:
+    """Auto warmup to avoid over-smoothing early. Warmup = 15% of max_steps."""
+    if target <= 0:
+        return 0.0
+    warmup = max(1, int(0.15 * max_steps))
+    if step <= 0:
+        return 0.0
+    if step >= warmup:
+        return float(target)
+    return float(target) * (float(step) / float(warmup))
+
+
+def _potts_neighbor_disagreement(probs: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Differentiable Potts-style smoothness:
+    penalty = 1 - sum_k p_i,k * p_j,k for neighbors (i,j).
+
+    probs: (B, K, H, W)
+    valid_mask: optional (B, 1, H, W) in {0,1} (or [0,1]) to gate valid pixels.
+    """
+    agree_v = (probs[:, :, 1:, :] * probs[:, :, :-1, :]).sum(dim=1)  # (B,H-1,W)
+    agree_h = (probs[:, :, :, 1:] * probs[:, :, :, :-1]).sum(dim=1)  # (B,H,W-1)
+    dis_v = 1.0 - agree_v
+    dis_h = 1.0 - agree_h
+    if valid_mask is None:
+        return dis_v.mean() + dis_h.mean()
+    vh = (valid_mask[..., 1:, :] * valid_mask[..., :-1, :]).squeeze(1)
+    vw = (valid_mask[..., :, 1:] * valid_mask[..., :, :-1]).squeeze(1)
+    loss_v = (dis_v * vh).sum() / vh.sum().clamp(min=1.0)
+    loss_h = (dis_h * vw).sum() / vw.sum().clamp(min=1.0)
+    return loss_v + loss_h
+
+
+def _multiscale_smoothness(
+    probs: torch.Tensor, valid_mask: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Multi-scale smoothness on soft probabilities to suppress micro-islands.
+    Returns: (loss_total, loss_tv, loss_potts)
+    """
+    scales = (1, 2, 4)
+    tv_total = torch.zeros((), device=probs.device, dtype=probs.dtype)
+    potts_total = torch.zeros((), device=probs.device, dtype=probs.dtype)
+    count = 0
+
+    for scale in scales:
+        if int(scale) == 1:
+            p = probs
+            v = valid_mask
+        else:
+            k = int(scale)
+            p = F.avg_pool2d(probs, kernel_size=k, stride=k)
+            v = None
+            if valid_mask is not None:
+                v = F.avg_pool2d(valid_mask, kernel_size=k, stride=k)
+                v = (v > 0.5).to(dtype=p.dtype)
+
+        tv_total = tv_total + _tv_anisotropic(p, valid_mask=v)
+        potts_total = potts_total + _potts_neighbor_disagreement(p, valid_mask=v)
+        count += 1
+
+    tv_total = tv_total / float(count)
+    potts_total = potts_total / float(count)
+    total = 0.5 * tv_total + 0.5 * potts_total
+    return total, tv_total, potts_total
+
+
 def parse_args():
     base_parser = argparse.ArgumentParser(add_help=False)
     base_parser.add_argument(
@@ -179,6 +246,12 @@ def parse_args():
         type=int,
         default=-1,
         help="Warmup steps for TV (<=0 means auto: 15%% of max_train_steps).",
+    )
+    parser.add_argument(
+        "--lambda_smooth",
+        type=float,
+        default=0.0,
+        help="Smoothness weight (multi-scale Potts + TV) on soft probabilities. 0 disables.",
     )
     parser.add_argument(
         "--viz_smooth",
@@ -526,6 +599,19 @@ def main():
                 x0_pred = (noisy_layouts - sqrt_one_minus_a * noise_pred) / sqrt_a
                 probs = torch.softmax(x0_pred / args.ratio_temp, dim=1)
 
+                smooth_loss = torch.tensor(0.0, device=probs.device)
+                smooth_tv = torch.tensor(0.0, device=probs.device)
+                smooth_potts = torch.tensor(0.0, device=probs.device)
+                smooth_w = 0.0
+                if args.lambda_smooth is not None and float(args.lambda_smooth) > 0:
+                    probs_f = probs.float()
+                    valid_f = valid64.float() if valid64 is not None else None
+                    smooth_loss_f, smooth_tv_f, smooth_potts_f = _multiscale_smoothness(probs_f, valid_mask=valid_f)
+                    smooth_loss = smooth_loss_f.to(dtype=probs.dtype)
+                    smooth_tv = smooth_tv_f.to(dtype=probs.dtype)
+                    smooth_potts = smooth_potts_f.to(dtype=probs.dtype)
+                    smooth_w = _ramp_weight(global_step, args.max_train_steps, float(args.lambda_smooth))
+
                 if args.ratio_pool is not None and int(args.ratio_pool) > 1:
                     k = int(args.ratio_pool)
                     probs_p = F.avg_pool2d(probs, kernel_size=k, stride=k)
@@ -564,6 +650,7 @@ def main():
                     + args.lambda_ratio * ratio_loss
                     + float(args.lambda_prior) * prior_loss
                     + tv_w * tv_loss
+                    + smooth_w * smooth_loss
                 )
 
                 accelerator.backward(loss)
@@ -585,6 +672,10 @@ def main():
                                 "prior_loss": prior_loss.detach().item(),
 	                            "tv_loss": tv_loss.detach().item(),
                                 "tv_w": float(tv_w),
+                                "smooth_loss": smooth_loss.detach().item(),
+                                "smooth_tv": smooth_tv.detach().item(),
+                                "smooth_potts": smooth_potts.detach().item(),
+                                "smooth_w": float(smooth_w),
 	                        },
 	                        step=global_step,
 	                    )
@@ -638,6 +729,7 @@ def main():
             tv_warmup_steps = int(args.tv_warmup_steps)
             if tv_warmup_steps <= 0:
                 tv_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
+            smooth_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
             json.dump(
                 {
                     "dataset": args.dataset,
@@ -660,6 +752,8 @@ def main():
                     "ratio_pool": args.ratio_pool,
                     "lambda_tv": args.lambda_tv,
                     "tv_warmup_steps": tv_warmup_steps,
+                    "lambda_smooth": args.lambda_smooth,
+                    "smooth_warmup_steps": smooth_warmup_steps,
                     "viz_smooth": args.viz_smooth,
                 },
                 handle,

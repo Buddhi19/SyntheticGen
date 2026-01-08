@@ -2,7 +2,7 @@ data_root: /data/inr/llm/Datasets/LOVEDA
 dataset: loveda
 output_dir: /data/inr/llm/DIFF_CD/Diffusor/outputsV2/layout_ddpm_masked_sparse_80k
 
-image_size: 512
+image_size: 512 
 layout_size: 256
 ignore_index: 255
 loveda_split: Train
@@ -10,20 +10,21 @@ loveda_domains: Urban,Rural
 
 base_channels: 64
 layers_per_block: 1
-train_batch_size: 32
-max_train_steps: 80000
+train_batch_size: 80
+max_train_steps: 160000
 checkpointing_steps: 1000
 
 ratio_conditioning: masked
 p_keep: 0.3
 known_count_min: 1
 known_count_max: 3
-lambda_ratio: 1.0
+lambda_ratio: 0.2
 lambda_prior: 0.1
 ratio_prior_json: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/ratio_prior_loveda_train.json
 
-lambda_tv: 0.001
+lambda_tv: 0.0
 tv_warmup_steps: -1
+lambda_smooth: 0.002
 
 ratio_temp: 1.0
 ratio_pool: 8
