@@ -444,10 +444,12 @@ def main():
         ratio_prior = ratio_prior / ratio_prior.sum().clamp(min=1e-8)
 
     def collate_fn(examples):
-        layouts = torch.stack([ex["layout_64"] for ex in examples])
+        layout_key = f"layout_{args.layout_size}"
+        valid_key = f"valid_{args.layout_size}"
+        layouts = torch.stack([ex.get(layout_key, ex["layout_64"]) for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
-        valid64 = torch.stack([ex["valid_64"] for ex in examples])
-        return {"layout_64": layouts, "ratios": ratios, "valid_64": valid64}
+        valids = torch.stack([ex.get(valid_key, ex["valid_64"]) for ex in examples])
+        return {"layouts": layouts, "ratios": ratios, "valids": valids}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -572,9 +574,13 @@ def main():
         ratio_projector.train()
         for batch in train_dataloader:
             with accelerator.accumulate(unet):
-                layouts = batch["layout_64"].to(dtype=weight_dtype)
+                layouts = batch["layouts"].to(dtype=weight_dtype)
                 ratios_true = batch["ratios"].to(dtype=weight_dtype)
-                valid64 = batch["valid_64"].to(dtype=weight_dtype)
+                valid_mask = batch["valids"].to(dtype=weight_dtype)
+                if layouts.shape[-1] != args.layout_size or layouts.shape[-2] != args.layout_size:
+                    raise ValueError(
+                        f"Layout shape mismatch: got {tuple(layouts.shape)}, expected H=W={int(args.layout_size)}"
+                    )
                 layouts = layouts * 2.0 - 1.0
 
                 noise = torch.randn_like(layouts)
@@ -605,7 +611,7 @@ def main():
                 smooth_w = 0.0
                 if args.lambda_smooth is not None and float(args.lambda_smooth) > 0:
                     probs_f = probs.float()
-                    valid_f = valid64.float() if valid64 is not None else None
+                    valid_f = valid_mask.float() if valid_mask is not None else None
                     smooth_loss_f, smooth_tv_f, smooth_potts_f = _multiscale_smoothness(probs_f, valid_mask=valid_f)
                     smooth_loss = smooth_loss_f.to(dtype=probs.dtype)
                     smooth_tv = smooth_tv_f.to(dtype=probs.dtype)
@@ -615,10 +621,10 @@ def main():
                 if args.ratio_pool is not None and int(args.ratio_pool) > 1:
                     k = int(args.ratio_pool)
                     probs_p = F.avg_pool2d(probs, kernel_size=k, stride=k)
-                    valid_p = F.avg_pool2d(valid64, kernel_size=k, stride=k)
+                    valid_p = F.avg_pool2d(valid_mask, kernel_size=k, stride=k)
                 else:
                     probs_p = probs
-                    valid_p = valid64
+                    valid_p = valid_mask
 
                 weighted = (probs_p * valid_p).sum(dim=(2, 3))
                 denom = valid_p.sum(dim=(2, 3)).clamp(min=1.0)
@@ -642,7 +648,7 @@ def main():
                 tv_loss = torch.tensor(0.0, device=probs.device)
                 tv_w = 0.0
                 if args.lambda_tv is not None and float(args.lambda_tv) > 0:
-                    tv_loss = _tv_anisotropic(probs, valid_mask=valid64)
+                    tv_loss = _tv_anisotropic(probs, valid_mask=valid_mask)
                     tv_w = _tv_weight(global_step, args.max_train_steps, float(args.lambda_tv), int(args.tv_warmup_steps))
                 denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
                 loss = (

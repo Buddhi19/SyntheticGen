@@ -95,6 +95,8 @@ def parse_args():
     parser.add_argument("--loveda_split", type=str, default="Train")
     parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
     parser.add_argument("--prompt", type=str, default="a high-resolution satellite image")
+    parser.add_argument("--prompt_urban", type=str, default="A realistic remote sensing image of an urban area")
+    parser.add_argument("--prompt_rural", type=str, default="A realistic remote sensing image of a rural area")
     parser.add_argument("--train_batch_size", type=int, default=24)
     parser.add_argument("--num_train_epochs", type=int, default=50)
     parser.add_argument("--max_train_steps", type=int, default=40000)
@@ -306,6 +308,19 @@ def _get_tb_writer(accelerator: Accelerator):
     return getattr(tracker, "writer", None)
 
 
+def _encode_prompt(tokenizer, text_encoder, texts, device, dtype):
+    inputs = tokenizer(
+        texts,
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        embeds = text_encoder(inputs.input_ids.to(device))[0]
+    return embeds.to(dtype=dtype)
+
+
 def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
     labels = label_map.detach().cpu().numpy().astype(np.int64)
     return palette[labels]
@@ -503,7 +518,14 @@ def main():
         layouts = torch.stack([ex["layout_512"] for ex in examples])
         layouts_64 = torch.stack([ex["layout_64"] for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
-        return {"pixel_values": pixel_values, "layout_512": layouts, "layout_64": layouts_64, "ratios": ratios}
+        domains = [ex.get("domain", "") for ex in examples]
+        return {
+            "pixel_values": pixel_values,
+            "layout_512": layouts,
+            "layout_64": layouts_64,
+            "ratios": ratios,
+            "domain": domains,
+        }
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -654,27 +676,10 @@ def main():
         ema_ratio_projector.to(accelerator.device)
         ema_film_gate.to(accelerator.device)
 
-    text_inputs = tokenizer(
-        [args.prompt],
-        padding="max_length",
-        truncation=True,
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    )
-    with torch.no_grad():
-        prompt_embeds = text_encoder(text_inputs.input_ids.to(accelerator.device))[0]
-    prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
-
-    uncond_inputs = tokenizer(
-        [""],
-        padding="max_length",
-        truncation=True,
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    )
-    with torch.no_grad():
-        uncond_embeds = text_encoder(uncond_inputs.input_ids.to(accelerator.device))[0]
-    uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
+    prompt_embeds_default = _encode_prompt(tokenizer, text_encoder, [args.prompt], accelerator.device, weight_dtype)
+    prompt_embeds_urban = _encode_prompt(tokenizer, text_encoder, [args.prompt_urban], accelerator.device, weight_dtype)
+    prompt_embeds_rural = _encode_prompt(tokenizer, text_encoder, [args.prompt_rural], accelerator.device, weight_dtype)
+    uncond_embeds = _encode_prompt(tokenizer, text_encoder, [""], accelerator.device, weight_dtype)
 
     palette = build_palette(class_names, num_classes, dataset=args.dataset)
 
@@ -779,7 +784,23 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 ratio_emb = ratio_projector(ratios)
-                prompt_batch = prompt_embeds.repeat(bsz, 1, 1)
+                domains = batch.get("domain", None)
+                prompt_batch = prompt_embeds_default.repeat(bsz, 1, 1)
+                if isinstance(domains, (list, tuple)) and len(domains) == bsz:
+                    is_urban = torch.tensor(
+                        [str(d).lower().startswith("urb") for d in domains],
+                        device=accelerator.device,
+                        dtype=torch.bool,
+                    )
+                    is_rural = torch.tensor(
+                        [str(d).lower().startswith("rur") for d in domains],
+                        device=accelerator.device,
+                        dtype=torch.bool,
+                    )
+                    if is_urban.any():
+                        prompt_batch[is_urban] = prompt_embeds_urban.repeat(int(is_urban.sum().item()), 1, 1)
+                    if is_rural.any():
+                        prompt_batch[is_rural] = prompt_embeds_rural.repeat(int(is_rural.sum().item()), 1, 1)
                 if args.cfg_dropout_prob and args.cfg_dropout_prob > 0:
                     drop_txt = torch.rand((bsz,), device=accelerator.device) < args.cfg_dropout_prob
                     if drop_txt.any():
@@ -925,7 +946,7 @@ def main():
                             controlnet=accelerator.unwrap_model(controlnet),
                             unet=unet,
                             vae=vae,
-                            prompt_embeds=prompt_embeds,
+                            prompt_embeds=prompt_embeds_default,
                             ratio_projector=accelerator.unwrap_model(ratio_projector),
                             film_gate=accelerator.unwrap_model(film_gate),
                             scheduler=sample_scheduler,
@@ -944,6 +965,9 @@ def main():
                             meta_path = samples_dir / f"random_meta_step_{global_step:06d}.json"
                             meta = {
                                 "prompt": args.prompt,
+                                "prompt_default": args.prompt,
+                                "prompt_urban": args.prompt_urban,
+                                "prompt_rural": args.prompt_rural,
                                 "ratios": [float(x) for x in ratios_sample.detach().cpu().tolist()],
                                 "class_names": class_names,
                                 "layout_ckpt_for_sampling": args.layout_ckpt_for_sampling,
@@ -994,6 +1018,9 @@ def main():
                     "layout_size": args.layout_size,
                     "ignore_index": args.ignore_index,
                     "prompt": args.prompt,
+                    "prompt_default": args.prompt,
+                    "prompt_urban": args.prompt_urban,
+                    "prompt_rural": args.prompt_rural,
                     "base_model": args.pretrained_model_name_or_path,
                     "mask_mix_prob": args.mask_mix_prob,
                     "cfg_dropout_prob": args.cfg_dropout_prob,
