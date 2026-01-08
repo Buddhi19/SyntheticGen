@@ -277,7 +277,7 @@ class _SegmentationDataset(Dataset):
         }
 
         if self.return_layouts:
-            onehot_512, ratios, valid_512 = _label_to_onehot_and_ratios(label, self.num_classes, self.ignore_index)
+            onehot_512, ratios_full, valid_512 = _label_to_onehot_and_ratios(label, self.num_classes, self.ignore_index)
             onehot_small = F.interpolate(
                 onehot_512.unsqueeze(0),
                 size=(self.layout_size, self.layout_size),
@@ -288,6 +288,9 @@ class _SegmentationDataset(Dataset):
                 size=(self.layout_size, self.layout_size),
                 mode="nearest",
             ).squeeze(0)
+            counts_small = onehot_small.sum(dim=(1, 2))
+            denom_small = counts_small.sum().clamp(min=1.0)
+            ratios_small = counts_small / denom_small
 
             out.update(
                 {
@@ -299,7 +302,8 @@ class _SegmentationDataset(Dataset):
                     # Explicit keys (Stage A uses these)
                     f"layout_{self.layout_size}": onehot_small,
                     f"valid_{self.layout_size}": valid_small,
-                    "ratios": ratios,
+                    "ratios": ratios_full,
+                    f"ratios_{self.layout_size}": ratios_small,
                 }
             )
         if hasattr(self, "sample_domains"):

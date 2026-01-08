@@ -47,6 +47,12 @@ def parse_args():
     parser.add_argument("--loveda_split", type=str, default="Train")
     parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
     parser.add_argument("--image_size", type=int, default=512, help="Resize masks before ratio computation.")
+    parser.add_argument(
+        "--layout_size",
+        type=int,
+        default=64,
+        help="Layout size used to compute ratios (downsampled one-hot mask size).",
+    )
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--output_path", type=str, default="outputsV2/ratio_prior.json")
@@ -71,7 +77,7 @@ def _resolve_dataset(args, num_classes: int):
             ignore_index=args.ignore_index,
             num_classes=num_classes,
             return_layouts=True,
-            layout_size=64,
+            layout_size=int(args.layout_size),
         )
     return GenericSegDataset(
         args.data_root,
@@ -79,7 +85,7 @@ def _resolve_dataset(args, num_classes: int):
         num_classes=num_classes,
         ignore_index=args.ignore_index,
         return_layouts=True,
-        layout_size=64,
+        layout_size=int(args.layout_size),
     )
 
 
@@ -92,8 +98,16 @@ def main():
     ratio_sum = torch.zeros((num_classes,), dtype=torch.float64)
     count = 0
     for batch in loader:
-        ratios = batch["ratios"]  # (B,K)
-        ratio_sum += ratios.double().sum(dim=0)
+        layout_key = f"layout_{int(args.layout_size)}"
+        layouts = batch.get(layout_key, None)
+        if layouts is None:
+            layouts = batch.get("layout_64", None)
+        if layouts is None:
+            raise KeyError(f"Batch missing {layout_key} (and layout_64 fallback).")
+        counts = layouts.double().sum(dim=(2, 3))
+        denom = counts.sum(dim=1, keepdim=True).clamp(min=1.0)
+        ratios = counts / denom
+        ratio_sum += ratios.sum(dim=0)
         count += int(ratios.shape[0])
 
     if count <= 0:
@@ -105,6 +119,7 @@ def main():
         "dataset": args.dataset,
         "data_root": str(args.data_root),
         "image_size": int(args.image_size),
+        "layout_size": int(args.layout_size),
         "num_samples": int(count),
         "class_names": class_names,
         "ratio_prior": [float(x) for x in ratio_prior.tolist()],

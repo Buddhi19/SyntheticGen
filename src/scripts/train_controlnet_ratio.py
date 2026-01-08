@@ -765,7 +765,9 @@ def main():
                 bsz = layouts_true.shape[0]
                 use_coarse = (torch.rand((bsz,), device=accelerator.device) < args.mask_mix_prob).view(bsz, 1, 1, 1)
                 layouts = torch.where(use_coarse, layouts_coarse, layouts_true)
-                ratios = batch["ratios"].to(device=accelerator.device, dtype=weight_dtype)
+                counts = layouts.float().sum(dim=(2, 3))
+                denom = counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                ratios = (counts / denom).to(dtype=weight_dtype)
 
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample()
@@ -905,7 +907,7 @@ def main():
                             os.makedirs(lora_ckpt_dir, exist_ok=True)
                             unet.save_attn_procs(lora_ckpt_dir, weight_name=args.lora_weight_name)
                         if layout_sampler is not None:
-                            ratios_sample = _sample_random_ratios_dirichlet(
+                            ratios_requested = _sample_random_ratios_dirichlet(
                                 num_classes=num_classes,
                                 alpha=args.random_ratio_alpha,
                                 seed=args.sample_seed + global_step,
@@ -913,17 +915,24 @@ def main():
                                 dtype=weight_dtype,
                             )
                             layout_unet, layout_ratio_projector, layout_scheduler = layout_sampler
-                            layouts_sample = _sample_layout_from_ratios(
+                            layouts_latents = _sample_layout_from_ratios(
                                 layout_unet=layout_unet,
                                 layout_ratio_projector=layout_ratio_projector,
                                 layout_scheduler=layout_scheduler,
-                                ratios=ratios_sample,
+                                ratios=ratios_requested,
                                 num_inference_steps=args.sample_num_inference_steps_layout,
                                 seed=args.sample_seed + global_step,
                                 output_dtype=weight_dtype,
                             )
+                            layout_ids = layouts_latents.argmax(dim=1)
+                            layouts_sample_small = (
+                                F.one_hot(layout_ids, num_classes=num_classes).permute(0, 3, 1, 2).float()
+                            )
+                            counts = layouts_sample_small.float().sum(dim=(2, 3))
+                            denom = counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                            ratios_sample = (counts / denom)[0].to(dtype=weight_dtype)
                             layouts_sample = F.interpolate(
-                                layouts_sample,
+                                layouts_sample_small,
                                 size=(args.image_size, args.image_size),
                                 mode="nearest",
                             )
@@ -969,6 +978,8 @@ def main():
                                 "prompt_urban": args.prompt_urban,
                                 "prompt_rural": args.prompt_rural,
                                 "ratios": [float(x) for x in ratios_sample.detach().cpu().tolist()],
+                                "ratios_requested": [float(x) for x in ratios_requested.detach().cpu().tolist()],
+                                "ratios_used": [float(x) for x in ratios_sample.detach().cpu().tolist()],
                                 "class_names": class_names,
                                 "layout_ckpt_for_sampling": args.layout_ckpt_for_sampling,
                                 "seed": int(args.sample_seed + global_step),

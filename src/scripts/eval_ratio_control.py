@@ -110,8 +110,20 @@ def _collect_ratio_targets(dataset, num_samples: int, layout_size: int):
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
     targets = []
     for batch in loader:
-        ratios = batch["ratios"][0]
-        valid = batch.get("valid_64")
+        layout_key = f"layout_{int(layout_size)}"
+        valid_key = f"valid_{int(layout_size)}"
+        layouts = batch.get(layout_key, None)
+        if layouts is None:
+            layouts = batch.get("layout_64", None)
+        if layouts is None:
+            raise KeyError(f"Batch missing {layout_key} (and layout_64 fallback).")
+        counts = layouts.float().sum(dim=(2, 3))
+        denom = counts.sum(dim=1, keepdim=True).clamp(min=1.0)
+        ratios = (counts / denom)[0]
+
+        valid = batch.get(valid_key, None)
+        if valid is None:
+            valid = batch.get("valid_64", None)
         if valid is None:
             valid = torch.ones((1, layout_size, layout_size), dtype=torch.float32)
         else:

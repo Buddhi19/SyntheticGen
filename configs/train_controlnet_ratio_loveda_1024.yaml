@@ -13,8 +13,8 @@ prompt_urban: A high-resolution satellite image of an urban area
 prompt_rural: A high-resolution satellite image of a rural area
 
 learning_rate: 1.0e-5
-train_batch_size: 24
-max_train_steps: 40000
+train_batch_size: 12
+max_train_steps: 140000
 checkpointing_steps: 1000
 
 mask_mix_prob: 0.5

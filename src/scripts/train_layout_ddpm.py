@@ -575,12 +575,14 @@ def main():
         for batch in train_dataloader:
             with accelerator.accumulate(unet):
                 layouts = batch["layouts"].to(dtype=weight_dtype)
-                ratios_true = batch["ratios"].to(dtype=weight_dtype)
                 valid_mask = batch["valids"].to(dtype=weight_dtype)
                 if layouts.shape[-1] != args.layout_size or layouts.shape[-2] != args.layout_size:
                     raise ValueError(
                         f"Layout shape mismatch: got {tuple(layouts.shape)}, expected H=W={int(args.layout_size)}"
                     )
+                counts = layouts.float().sum(dim=(2, 3))
+                denom = counts.sum(dim=1, keepdim=True).clamp(min=1.0)
+                ratios_true = (counts / denom).to(dtype=weight_dtype)
                 layouts = layouts * 2.0 - 1.0
 
                 noise = torch.randn_like(layouts)
