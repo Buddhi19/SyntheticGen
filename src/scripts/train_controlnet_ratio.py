@@ -415,13 +415,37 @@ def _log_controlnet_sample(
     palette: np.ndarray,
     num_inference_steps: int,
     lora_scale: float,
-) -> None:
+    prompt_embeds_urban: torch.Tensor | None = None,
+    prompt_embeds_rural: torch.Tensor | None = None,
+    prompt_domain: str | None = None,
+) -> str:
     writer = _get_tb_writer(accelerator)
     generator = torch.Generator(device=layouts.device).manual_seed(seed)
 
+    prompt_tag = "default"
+    prompt_selected = prompt_embeds
+    if prompt_domain is not None:
+        dom = str(prompt_domain).strip().lower()
+        if dom.startswith("urb") and prompt_embeds_urban is not None:
+            prompt_tag = "urban"
+            prompt_selected = prompt_embeds_urban
+        elif dom.startswith("rur") and prompt_embeds_rural is not None:
+            prompt_tag = "rural"
+            prompt_selected = prompt_embeds_rural
+    else:
+        candidates = []
+        if prompt_embeds_urban is not None:
+            candidates.append(("urban", prompt_embeds_urban))
+        if prompt_embeds_rural is not None:
+            candidates.append(("rural", prompt_embeds_rural))
+        if candidates:
+            domain_gen = torch.Generator(device=layouts.device).manual_seed(int(seed) + int(step))
+            idx = int(torch.randint(0, len(candidates), (1,), generator=domain_gen, device=layouts.device).item())
+            prompt_tag, prompt_selected = candidates[idx]
+
     ratio_dtype = next(ratio_projector.parameters()).dtype
     ratios = ratios.to(device=layouts.device, dtype=ratio_dtype)
-    ratio_emb = ratio_projector(ratios.unsqueeze(0)).to(dtype=prompt_embeds.dtype)
+    ratio_emb = ratio_projector(ratios.unsqueeze(0)).to(dtype=prompt_selected.dtype)
     cross_kwargs = None
     if lora_scale is not None and float(lora_scale) != 1.0:
         cross_kwargs = {"scale": float(lora_scale)}
@@ -429,7 +453,7 @@ def _log_controlnet_sample(
         (1, unet.config.in_channels, layouts.shape[-1] // 8, layouts.shape[-1] // 8),
         generator=generator,
         device=layouts.device,
-        dtype=prompt_embeds.dtype,
+        dtype=prompt_selected.dtype,
     )
     latents = latents * scheduler.init_noise_sigma
     scheduler.set_timesteps(num_inference_steps, device=layouts.device)
@@ -439,7 +463,7 @@ def _log_controlnet_sample(
             down_samples, mid_sample = controlnet(
                 latents,
                 timestep,
-                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states=prompt_selected,
                 controlnet_cond=layouts,
                 class_labels=ratio_emb,
                 return_dict=False,
@@ -450,14 +474,14 @@ def _log_controlnet_sample(
             noise_pred = unet(
                 latents,
                 timestep,
-                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states=prompt_selected,
                 class_labels=ratio_emb,
                 down_block_additional_residuals=down_samples,
                 mid_block_additional_residual=mid_sample,
                 cross_attention_kwargs=cross_kwargs,
             ).sample
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
-            latents = latents.to(dtype=prompt_embeds.dtype)
+            latents = latents.to(dtype=prompt_selected.dtype)
 
     image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
 
@@ -474,6 +498,9 @@ def _log_controlnet_sample(
     if writer is not None:
         writer.add_image("samples/image", image_array, step, dataformats="HWC")
         writer.add_image("samples/layout", layout_color, step, dataformats="HWC")
+        writer.add_text("samples/prompt_domain", prompt_tag, step)
+
+    return prompt_tag
 
 
 def main():
@@ -950,12 +977,25 @@ def main():
                             ema_controlnet.copy_to(controlnet.parameters())
                             ema_ratio_projector.copy_to(ratio_projector.parameters())
                             ema_film_gate.copy_to(film_gate.parameters())
-                        _log_controlnet_sample(
+                        sample_prompt_urban = None
+                        sample_prompt_rural = None
+                        if args.dataset == "loveda":
+                            active_domains = [
+                                d.strip().lower() for d in str(args.loveda_domains).split(",") if d.strip()
+                            ]
+                            if any(d.startswith("urb") for d in active_domains):
+                                sample_prompt_urban = prompt_embeds_urban
+                            if any(d.startswith("rur") for d in active_domains):
+                                sample_prompt_rural = prompt_embeds_rural
+
+                        prompt_domain_used = _log_controlnet_sample(
                             accelerator=accelerator,
                             controlnet=accelerator.unwrap_model(controlnet),
                             unet=unet,
                             vae=vae,
                             prompt_embeds=prompt_embeds_default,
+                            prompt_embeds_urban=sample_prompt_urban,
+                            prompt_embeds_rural=sample_prompt_rural,
                             ratio_projector=accelerator.unwrap_model(ratio_projector),
                             film_gate=accelerator.unwrap_model(film_gate),
                             scheduler=sample_scheduler,
@@ -972,11 +1012,17 @@ def main():
                             samples_dir = Path(args.output_dir) / "samples"
                             samples_dir.mkdir(parents=True, exist_ok=True)
                             meta_path = samples_dir / f"random_meta_step_{global_step:06d}.json"
+                            prompt_used = args.prompt
+                            if prompt_domain_used == "urban":
+                                prompt_used = args.prompt_urban
+                            elif prompt_domain_used == "rural":
+                                prompt_used = args.prompt_rural
                             meta = {
-                                "prompt": args.prompt,
+                                "prompt": prompt_used,
                                 "prompt_default": args.prompt,
                                 "prompt_urban": args.prompt_urban,
                                 "prompt_rural": args.prompt_rural,
+                                "prompt_domain_used": prompt_domain_used,
                                 "ratios": [float(x) for x in ratios_sample.detach().cpu().tolist()],
                                 "ratios_requested": [float(x) for x in ratios_requested.detach().cpu().tolist()],
                                 "ratios_used": [float(x) for x in ratios_sample.detach().cpu().tolist()],

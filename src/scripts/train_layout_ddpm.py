@@ -116,7 +116,7 @@ def _multiscale_smoothness(
     Multi-scale smoothness on soft probabilities to suppress micro-islands.
     Returns: (loss_total, loss_tv, loss_potts)
     """
-    scales = (1, 2, 4)
+    scales = (1, 2, 4, 8)
     tv_total = torch.zeros((), device=probs.device, dtype=probs.dtype)
     potts_total = torch.zeros((), device=probs.device, dtype=probs.dtype)
     count = 0
@@ -139,8 +139,32 @@ def _multiscale_smoothness(
 
     tv_total = tv_total / float(count)
     potts_total = potts_total / float(count)
-    total = 0.5 * tv_total + 0.5 * potts_total
+    # Potts (neighbor disagreement) tends to suppress micro-islands more effectively than TV alone.
+    total = 0.25 * tv_total + 0.75 * potts_total
     return total, tv_total, potts_total
+
+
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Masked MSE over valid pixels.
+
+    pred/target: (B, C, H, W)
+    valid_mask: (B, 1, H, W) in {0,1} (or [0,1])
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"masked_mse: pred/target shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
+    if valid_mask.ndim != 4 or valid_mask.shape[1] != 1:
+        raise ValueError(f"masked_mse: expected valid_mask (B,1,H,W), got {tuple(valid_mask.shape)}")
+    if valid_mask.shape[0] != pred.shape[0] or valid_mask.shape[2:] != pred.shape[2:]:
+        raise ValueError(
+            f"masked_mse: valid_mask spatial mismatch: pred {tuple(pred.shape)} vs mask {tuple(valid_mask.shape)}"
+        )
+
+    diff2 = (pred - target).pow(2)
+    m = valid_mask.to(dtype=diff2.dtype)
+    diff2 = diff2 * m  # broadcast to channels
+    denom = valid_mask.to(dtype=torch.float32).sum() * float(pred.shape[1])
+    return diff2.sum() / denom.clamp(min=1.0)
 
 
 def parse_args():
@@ -233,6 +257,37 @@ def parse_args():
         default=0,
         help="When --ratio_conditioning=masked, if >0 enforce at most this many known classes per sample.",
     )
+    parser.add_argument(
+        "--present_eps",
+        type=float,
+        default=0.001,
+        help="When --ratio_conditioning=masked, classes with ratio_true > present_eps are considered 'present' "
+        "for known-mask sampling.",
+    )
+    parser.add_argument(
+        "--add_negative_class",
+        action="store_true",
+        help="When --ratio_conditioning=masked, also reveal one absent class (ratio==0) as a 'known negative' "
+        "to stabilize conditioning.",
+    )
+    parser.add_argument(
+        "--min_unknown_for_prior",
+        type=int,
+        default=3,
+        help="Compute prior KL only if unknown class count >= this value (masked mode).",
+    )
+    parser.add_argument(
+        "--min_unknown_mass_for_prior",
+        type=float,
+        default=0.05,
+        help="Compute prior KL only if total unknown mass >= this value (masked mode).",
+    )
+    parser.add_argument(
+        "--lambda_ce",
+        type=float,
+        default=0.0,
+        help="Optional auxiliary cross-entropy loss on x0_pred vs ground-truth labels (helps categorical layouts).",
+    )
     parser.add_argument("--lambda_prior", type=float, default=0.0, help="Optional prior loss weight on unknown ratios.")
     parser.add_argument(
         "--ratio_prior_json",
@@ -264,6 +319,24 @@ def parse_args():
         type=float,
         default=0.0,
         help="Smoothness weight (multi-scale Potts + TV) on soft probabilities. 0 disables.",
+    )
+    parser.add_argument(
+        "--smooth_warmup_steps",
+        type=int,
+        default=-1,
+        help="Warmup steps for smoothness (<=0 means auto: 15%% of max_train_steps).",
+    )
+    parser.add_argument(
+        "--lambda_ent",
+        type=float,
+        default=0.0,
+        help="Entropy penalty on probs to sharpen (encourages one-hot decisions). 0 disables.",
+    )
+    parser.add_argument(
+        "--ent_warmup_steps",
+        type=int,
+        default=-1,
+        help="Warmup steps for entropy (<=0 means auto: 15%% of max_train_steps).",
     )
     parser.add_argument(
         "--viz_smooth",
@@ -370,12 +443,17 @@ def _log_layout_sample(
     )
     layout_latents = layout_latents * noise_scheduler.init_noise_sigma
     noise_scheduler.set_timesteps(num_inference_steps, device=ratios.device)
+    x0_pred_last = None
     with torch.no_grad():
         for timestep in noise_scheduler.timesteps:
             noise_pred = unet(layout_latents, timestep, class_labels=ratio_emb).sample
-            layout_latents = noise_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
+            out = noise_scheduler.step(noise_pred, timestep, layout_latents)
+            layout_latents = out.prev_sample
+            if hasattr(out, "pred_original_sample") and out.pred_original_sample is not None:
+                x0_pred_last = out.pred_original_sample
 
-    probs = torch.softmax(layout_latents / float(ratio_temp), dim=1)
+    layout_logits = x0_pred_last if x0_pred_last is not None else layout_latents
+    probs = torch.softmax(layout_logits / float(ratio_temp), dim=1)
     valid = torch.ones((1, 1, layout_size, layout_size), device=layout_latents.device, dtype=probs.dtype)
     if ratio_pool is not None and int(ratio_pool) > 1:
         k = int(ratio_pool)
@@ -393,12 +471,12 @@ def _log_layout_sample(
         mask = known_mask.to(dtype=r_hat.dtype)
         ratio_mae = ((r_hat - ratios).abs() * mask).sum() / mask.sum().clamp(min=1.0)
 
-    layout_logits = layout_latents
+    layout_logits_viz = layout_logits
     if viz_smooth is not None and int(viz_smooth) > 1:
         k = int(viz_smooth)
         pad = k // 2
-        layout_logits = F.avg_pool2d(layout_logits, kernel_size=k, stride=1, padding=pad)
-    layout_ids = layout_logits.argmax(dim=1)[0]
+        layout_logits_viz = F.avg_pool2d(layout_logits_viz, kernel_size=k, stride=1, padding=pad)
+    layout_ids = layout_logits_viz.argmax(dim=1)[0]
     color = _colorize_labels(layout_ids, palette)
     samples_dir = Path(output_dir) / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
@@ -548,38 +626,74 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
-    def _sample_known_mask(
-        batch_size: int, num_classes: int, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
+    def _sample_known_mask_present_aware(ratios_true: torch.Tensor) -> torch.Tensor:
+        """
+        Present-aware known-mask sampling for masked ratio conditioning.
+
+        Only sample 'known' labels primarily from classes actually present in the layout; otherwise the model sees
+        mostly trivial known==0 constraints and can learn speckle/micro-island solutions.
+        """
+        if ratios_true.ndim != 2:
+            raise ValueError(f"Expected ratios_true (B,C), got {tuple(ratios_true.shape)}")
+        batch_size, num_classes = ratios_true.shape
+        device = ratios_true.device
+        dtype = ratios_true.dtype
+
         p_keep = float(args.p_keep)
         known_min = int(args.known_count_min)
         known_max = int(args.known_count_max)
+        eps = float(args.present_eps)
+
+        present = ratios_true.float() > eps  # (B,C) bool
+
         if p_keep <= 0.0:
             mask = torch.zeros((batch_size, num_classes), device=device, dtype=dtype)
         elif p_keep >= 1.0:
-            mask = torch.ones((batch_size, num_classes), device=device, dtype=dtype)
+            mask = present.to(dtype=dtype)
         else:
-            mask = (torch.rand((batch_size, num_classes), device=device) < p_keep).to(dtype=dtype)
+            rnd = torch.rand((batch_size, num_classes), device=device)
+            mask = ((rnd < p_keep) & present).to(dtype=dtype)
 
         if known_max > 0 and known_max < num_classes:
             for i in range(batch_size):
                 on = torch.nonzero(mask[i] > 0, as_tuple=False).flatten()
-                if on.numel() > known_max:
-                    perm = torch.randperm(on.numel(), device=device)
-                    drop = on[perm[known_max:]]
-                    mask[i, drop] = 0
+                if on.numel() <= known_max:
+                    continue
+                vals = ratios_true[i, on].float()
+                keep = on[torch.argsort(vals, descending=True)[:known_max]]
+                new_mask = torch.zeros((num_classes,), device=device, dtype=dtype)
+                new_mask[keep] = 1
+                mask[i] = new_mask
 
         if known_min > 0 and known_min <= num_classes:
             for i in range(batch_size):
                 on = torch.nonzero(mask[i] > 0, as_tuple=False).flatten()
                 if on.numel() >= known_min:
                     continue
-                off = torch.nonzero(mask[i] <= 0, as_tuple=False).flatten()
-                if off.numel() == 0:
+
+                pres = torch.nonzero(present[i], as_tuple=False).flatten()
+                if pres.numel() == 0:
+                    pres = torch.argmax(ratios_true[i].float()).view(1)
+
+                cand = pres[mask[i, pres] <= 0]
+                if cand.numel() == 0:
                     continue
-                need = min(known_min - int(on.numel()), int(off.numel()))
-                perm = torch.randperm(off.numel(), device=device)[:need]
-                mask[i, off[perm]] = 1
+                need = min(known_min - int(on.numel()), int(cand.numel()))
+                w = ratios_true[i, cand].float().clamp(min=1e-8)
+                pick = cand[torch.multinomial(w, num_samples=need, replacement=False)]
+                mask[i, pick] = 1
+
+        if bool(args.add_negative_class):
+            for i in range(batch_size):
+                absent = torch.nonzero(~present[i], as_tuple=False).flatten()
+                if absent.numel() == 0:
+                    continue
+                if known_max > 0:
+                    current = int((mask[i] > 0).sum().item())
+                    if current >= known_max:
+                        continue
+                j = absent[torch.randint(0, absent.numel(), (1,), device=device)]
+                mask[i, j] = 1
 
         return mask
 
@@ -608,7 +722,7 @@ def main():
                 known_mask = None
                 ratios_obs = ratios_true
                 if args.ratio_conditioning == "masked":
-                    known_mask = _sample_known_mask(layouts.shape[0], num_classes, layouts.device, ratios_true.dtype)
+                    known_mask = _sample_known_mask_present_aware(ratios_true)
                     ratios_obs = ratios_true * known_mask
                     ratio_emb = ratio_projector(ratios_obs, known_mask)
                 else:
@@ -621,6 +735,25 @@ def main():
                 x0_pred = (noisy_layouts - sqrt_one_minus_a * noise_pred) / sqrt_a
                 probs = torch.softmax(x0_pred / args.ratio_temp, dim=1)
 
+                ent_loss = torch.tensor(0.0, device=probs.device)
+                ent_w = 0.0
+                if args.lambda_ent is not None and float(args.lambda_ent) > 0:
+                    p = probs.float().clamp(min=1e-8)
+                    ent = -(p * p.log()).sum(dim=1)  # (B,H,W)
+                    v = valid_mask.squeeze(1).float()
+                    ent_loss = (ent * v).sum() / v.sum().clamp(min=1.0)
+                    ent_w = _tv_weight(
+                        global_step, args.max_train_steps, float(args.lambda_ent), int(args.ent_warmup_steps)
+                    )
+
+                ce_loss = torch.tensor(0.0, device=probs.device)
+                ce_w = 0.0
+                if args.lambda_ce is not None and float(args.lambda_ce) > 0:
+                    y = batch["layouts"].argmax(dim=1)  # (B,H,W)
+                    y = y.masked_fill(valid_mask.squeeze(1) <= 0.5, -100)
+                    ce_loss = F.cross_entropy(x0_pred.float(), y.long(), ignore_index=-100)
+                    ce_w = _ramp_weight(global_step, args.max_train_steps, float(args.lambda_ce))
+
                 smooth_loss = torch.tensor(0.0, device=probs.device)
                 smooth_tv = torch.tensor(0.0, device=probs.device)
                 smooth_potts = torch.tensor(0.0, device=probs.device)
@@ -632,7 +765,9 @@ def main():
                     smooth_loss = smooth_loss_f.to(dtype=probs.dtype)
                     smooth_tv = smooth_tv_f.to(dtype=probs.dtype)
                     smooth_potts = smooth_potts_f.to(dtype=probs.dtype)
-                    smooth_w = _ramp_weight(global_step, args.max_train_steps, float(args.lambda_smooth))
+                    smooth_w = _tv_weight(
+                        global_step, args.max_train_steps, float(args.lambda_smooth), int(args.smooth_warmup_steps)
+                    )
 
                 if args.ratio_pool is not None and int(args.ratio_pool) > 1:
                     k = int(args.ratio_pool)
@@ -659,24 +794,35 @@ def main():
                     ratio_loss = float(args.ratio_known_weight) * ratio_loss_known + float(args.ratio_unknown_weight) * ratio_loss_unknown
                     prior_loss = torch.tensor(0.0, device=r_hat.device)
                     if ratio_prior is not None and args.lambda_prior is not None and float(args.lambda_prior) > 0:
-                        r_hat_rem = r_hat.float() * unknown_f.float()
-                        r_hat_rem = r_hat_rem / r_hat_rem.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                        p0 = ratio_prior.to(device=r_hat.device, dtype=torch.float32).unsqueeze(0) * unknown_f.float()
-                        p0 = p0 / p0.sum(dim=1, keepdim=True).clamp(min=1e-8)
-                        prior_loss = (r_hat_rem * ((r_hat_rem + 1e-8).log() - (p0 + 1e-8).log())).sum(dim=1).mean()
+                        unknown_count = (unknown_f > 0.5).sum(dim=1)
+                        unknown_mass = (r_hat.float() * unknown_f.float()).sum(dim=1)
+                        eligible = (unknown_count >= int(args.min_unknown_for_prior)) & (
+                            unknown_mass >= float(args.min_unknown_mass_for_prior)
+                        )
+                        if torch.any(eligible):
+                            r_hat_rem = r_hat.float() * unknown_f.float()
+                            r_hat_rem = r_hat_rem / r_hat_rem.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                            p0 = ratio_prior.to(device=r_hat.device, dtype=torch.float32).unsqueeze(0) * unknown_f.float()
+                            p0 = p0 / p0.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                            kl_vec = (r_hat_rem * ((r_hat_rem + 1e-8).log() - (p0 + 1e-8).log())).sum(dim=1)
+                            prior_loss = kl_vec[eligible].mean()
+                        else:
+                            prior_loss = torch.tensor(0.0, device=r_hat.device)
 
                 tv_loss = torch.tensor(0.0, device=probs.device)
                 tv_w = 0.0
                 if args.lambda_tv is not None and float(args.lambda_tv) > 0:
                     tv_loss = _tv_anisotropic(probs, valid_mask=valid_mask)
                     tv_w = _tv_weight(global_step, args.max_train_steps, float(args.lambda_tv), int(args.tv_warmup_steps))
-                denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                denoise_loss = masked_mse(noise_pred.float(), noise.float(), valid_mask.float())
                 loss = (
                     denoise_loss
                     + args.lambda_ratio * ratio_loss
                     + float(args.lambda_prior) * prior_loss
                     + tv_w * tv_loss
                     + smooth_w * smooth_loss
+                    + ce_w * ce_loss
+                    + ent_w * ent_loss
                 )
 
                 accelerator.backward(loss)
@@ -692,23 +838,27 @@ def main():
                 if global_step % args.logging_steps == 0:
                     accelerator.log(
                         {
-	                            "train_loss": loss.detach().item(),
-	                            "denoise_loss": denoise_loss.detach().item(),
-	                            "ratio_loss": ratio_loss.detach().item(),
+                            "train_loss": loss.detach().item(),
+                            "denoise_loss": denoise_loss.detach().item(),
+                            "ratio_loss": ratio_loss.detach().item(),
                                 "ratio_loss_known": ratio_loss_known.detach().item(),
                                 "ratio_loss_unknown": ratio_loss_unknown.detach().item(),
                                 "ratio_known_w": float(args.ratio_known_weight),
                                 "ratio_unknown_w": float(args.ratio_unknown_weight),
                                 "prior_loss": prior_loss.detach().item(),
-	                            "tv_loss": tv_loss.detach().item(),
+                            "tv_loss": tv_loss.detach().item(),
                                 "tv_w": float(tv_w),
                                 "smooth_loss": smooth_loss.detach().item(),
                                 "smooth_tv": smooth_tv.detach().item(),
                                 "smooth_potts": smooth_potts.detach().item(),
                                 "smooth_w": float(smooth_w),
-	                        },
-	                        step=global_step,
-	                    )
+                                "ce_loss": ce_loss.detach().item(),
+                                "ce_w": float(ce_w),
+                                "ent_loss": ent_loss.detach().item(),
+                                "ent_w": float(ent_w),
+                        },
+                        step=global_step,
+                    )
 
                 if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -759,7 +909,12 @@ def main():
             tv_warmup_steps = int(args.tv_warmup_steps)
             if tv_warmup_steps <= 0:
                 tv_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
-            smooth_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
+            smooth_warmup_steps = int(args.smooth_warmup_steps)
+            if smooth_warmup_steps <= 0:
+                smooth_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
+            ent_warmup_steps = int(args.ent_warmup_steps)
+            if ent_warmup_steps <= 0:
+                ent_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
             json.dump(
                 {
                     "dataset": args.dataset,
@@ -775,6 +930,10 @@ def main():
                     "p_keep": args.p_keep,
                     "known_count_min": args.known_count_min,
                     "known_count_max": args.known_count_max,
+                    "present_eps": args.present_eps,
+                    "add_negative_class": bool(args.add_negative_class),
+                    "min_unknown_for_prior": args.min_unknown_for_prior,
+                    "min_unknown_mass_for_prior": args.min_unknown_mass_for_prior,
                     "ratio_known_weight": args.ratio_known_weight,
                     "ratio_unknown_weight": args.ratio_unknown_weight,
                     "lambda_prior": args.lambda_prior,
@@ -782,10 +941,13 @@ def main():
                     "ratio_projector_input_dim": getattr(unwrapped_ratio, "input_dim", num_classes),
                     "ratio_temp": args.ratio_temp,
                     "ratio_pool": args.ratio_pool,
+                    "lambda_ce": args.lambda_ce,
                     "lambda_tv": args.lambda_tv,
                     "tv_warmup_steps": tv_warmup_steps,
                     "lambda_smooth": args.lambda_smooth,
                     "smooth_warmup_steps": smooth_warmup_steps,
+                    "lambda_ent": args.lambda_ent,
+                    "ent_warmup_steps": ent_warmup_steps,
                     "viz_smooth": args.viz_smooth,
                 },
                 handle,
