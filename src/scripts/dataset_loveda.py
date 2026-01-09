@@ -277,22 +277,37 @@ class _SegmentationDataset(Dataset):
         }
 
         if self.return_layouts:
-            onehot_512, ratios, valid_512 = _label_to_onehot_and_ratios(label, self.num_classes, self.ignore_index)
-            onehot_64 = F.interpolate(
-                onehot_512.unsqueeze(0), size=(self.layout_size, self.layout_size), mode="nearest"
+            onehot_512, ratios_full, valid_512 = _label_to_onehot_and_ratios(label, self.num_classes, self.ignore_index)
+            onehot_small = F.interpolate(
+                onehot_512.unsqueeze(0),
+                size=(self.layout_size, self.layout_size),
+                mode="nearest",
             ).squeeze(0)
-            valid_64 = F.interpolate(
-                valid_512.unsqueeze(0), size=(self.layout_size, self.layout_size), mode="nearest"
+            valid_small = F.interpolate(
+                valid_512.unsqueeze(0),
+                size=(self.layout_size, self.layout_size),
+                mode="nearest",
             ).squeeze(0)
+            counts_small = onehot_small.sum(dim=(1, 2))
+            denom_small = counts_small.sum().clamp(min=1.0)
+            ratios_small = counts_small / denom_small
 
             out.update(
                 {
                     "layout_512": onehot_512,
-                    "layout_64": onehot_64,
-                    "ratios": ratios,
-                    "valid_64": valid_64,
+                    "valid_512": valid_512,
+                    # Backward compatible keys (Stage B / older code)
+                    "layout_64": onehot_small,
+                    "valid_64": valid_small,
+                    # Explicit keys (Stage A uses these)
+                    f"layout_{self.layout_size}": onehot_small,
+                    f"valid_{self.layout_size}": valid_small,
+                    "ratios": ratios_full,
+                    f"ratios_{self.layout_size}": ratios_small,
                 }
             )
+        if hasattr(self, "sample_domains"):
+            out["domain"] = self.sample_domains[idx]
         return out
 
 
@@ -336,14 +351,19 @@ class LoveDADataset(_SegmentationDataset):
         if split_dir is None:
             raise FileNotFoundError(f"Could not find split '{split}' under {root}.")
         pairs: List[Tuple[Path, Path]] = []
+        sample_domains: List[str] = []
+
         for domain in domains:
             domain_dir = _resolve_domain_dir(split_dir, domain)
             if domain_dir is None:
                 continue
             try:
-                pairs.extend(_discover_pairs(domain_dir))
+                dom_pairs = _discover_pairs(domain_dir)
             except FileNotFoundError:
                 continue
+
+            pairs.extend(dom_pairs)
+            sample_domains.extend([str(domain).lower()] * len(dom_pairs))
         if not pairs:
             raise FileNotFoundError("No LoveDA pairs found. Check split/domains structure.")
 
@@ -357,3 +377,4 @@ class LoveDADataset(_SegmentationDataset):
             layout_size=layout_size,
             label_remap=label_remap,
         )
+        self.sample_domains = sample_domains

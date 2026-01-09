@@ -55,6 +55,23 @@ Masks should be single-channel label maps (integer class ids) or paletted PNGs.
 
 ## Training
 
+## YAML configs
+
+All scripts accept `--config` pointing to a YAML/JSON file (keys match CLI arg names). Example configs live in `configs/`.
+
+```bash
+# Stage A (DDPM) on 2 GPUs (6,7)
+CUDA_VISIBLE_DEVICES=6,7 python3 -m accelerate.commands.launch --multi_gpu --num_processes 2 --main_process_port 29507 \
+  src/scripts/train_layout_ddpm.py --config configs/train_layout_ddpm_masked_sparse_80k.yaml
+
+# Ratio prior
+python src/scripts/compute_ratio_prior.py --config configs/compute_ratio_prior_loveda_train.yaml
+
+# Stage B (ControlNet)
+CUDA_VISIBLE_DEVICES=6,7 python3 -m accelerate.commands.launch --multi_gpu --num_processes 2 --main_process_port 29509 \
+  src/scripts/train_controlnet_ratio.py --config configs/train_controlnet_ratio_loveda_1024.yaml
+```
+
 Stage A (layout DDPM):
 
 ```bash
@@ -66,6 +83,29 @@ python src/scripts/train_layout_ddpm.py \
   --sample_num_inference_steps 50 \
   --lambda_ratio 1.0 \
   --ratio_temp 1.0
+```
+
+Optional: train Stage A with sparse (partial) ratio conditioning:
+
+```bash
+python src/scripts/compute_ratio_prior.py \
+  --data_root /path/to/loveda \
+  --dataset loveda \
+  --image_size 1024 \
+  --output_path outputsV2/ratio_prior.json
+
+python src/scripts/train_layout_ddpm.py \
+  --data_root /path/to/loveda \
+  --dataset loveda \
+  --output_dir outputs/layout_ddpm_masked \
+  --image_size 1024 \
+  --layout_size 256 \
+  --ratio_conditioning masked \
+  --p_keep 0.3 \
+  --known_count_max 3 \
+  --lambda_ratio 1.0 \
+  --lambda_prior 0.1 \
+  --ratio_prior_json outputsV2/ratio_prior.json
 ```
 
 Stage B (ControlNet + FiLM ratio conditioning):
@@ -96,6 +136,44 @@ python src/scripts/sample_pair.py \
   --base_model /path/to/sd-v1-5 \
   --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
   --save_dir outputs/sample_pair
+```
+
+Sparse ratio constraints (works with Stage A checkpoints trained with `--ratio_conditioning masked`):
+
+```bash
+python src/scripts/sample_pair.py \
+  --layout_ckpt outputs/layout_ddpm_masked \
+  --controlnet_ckpt outputs/controlnet_ratio \
+  --base_model /path/to/sd-v1-5 \
+  --ratios "water:0.15,agriculture:0.10" \
+  --save_dir outputs/sample_pair_sparse
+```
+
+Example (specific checkpoint + single-class ratio):
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python src/scripts/sample_pair.py --config configs/sample_pair_ckpt40000_building0.4.yaml
+
+CUDA_VISIBLE_DEVICES=7 python /data/inr/llm/DIFF_CD/Diffusor/SyntheticGen/src/scripts/sample_pair.py \
+  --layout_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV2/layout_ddpm_export_80000 \
+  --controlnet_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV2/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-40000 \
+  --base_model /home/nvidia/.cache/huggingface/hub/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14 \
+  --lora_path /data/inr/llm/DIFF_CD/Diffusor/outputsV2/lora_loveda_sd15_r8/checkpoint-29000 \
+  --lora_weight_name pytorch_lora_weights.safetensors \
+  --lora_scale 1.0 \
+  --save_dir /data/inr/llm/DIFF_CD/Diffusor/outputsV2/results_generator/gpu7 \
+  --ratios "building:0.4" \
+  --prompt "a high-resolution satellite image" \
+  --image_size 1024 \
+  --num_inference_steps_layout 50 \
+  --num_inference_steps_image 30 \
+  --guidance_scale 1.0 \
+  --guidance_rescale 0.0 \
+  --control_scale 1.0 \
+  --seed 40000 \
+  --dtype fp16 \
+  --device cuda:0 \
+  --sampler ddim
 ```
 
 Img2img with a provided mask:

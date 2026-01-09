@@ -27,12 +27,14 @@ from diffusers.utils import check_min_version, is_wandb_available
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
+    from .config_utils import apply_config
     from ..models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
+    from src.scripts.config_utils import apply_config
     from src.models.ratio_conditioning import RatioProjector, infer_time_embed_dim_from_config
 
 
@@ -44,9 +46,115 @@ if is_wandb_available():
     import wandb  # noqa: F401
 
 
+def _tv_anisotropic(x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Anisotropic TV for 2D feature maps.
+
+    x: (B, C, H, W)
+    valid_mask: optional (B, 1, H, W) in {0,1} (or [0,1]) to gate valid pixels.
+    """
+    dx = x[..., 1:, :] - x[..., :-1, :]
+    dy = x[..., :, 1:] - x[..., :, :-1]
+    if valid_mask is None:
+        return dx.abs().mean() + dy.abs().mean()
+    vh = valid_mask[..., 1:, :] * valid_mask[..., :-1, :]
+    vw = valid_mask[..., :, 1:] * valid_mask[..., :, :-1]
+    tv_h = (dx.abs() * vh).sum() / vh.sum().clamp(min=1.0)
+    tv_w = (dy.abs() * vw).sum() / vw.sum().clamp(min=1.0)
+    return tv_h + tv_w
+
+
+def _tv_weight(step: int, max_steps: int, lambda_tv: float, warmup_steps: int) -> float:
+    if lambda_tv <= 0:
+        return 0.0
+    if warmup_steps is None or warmup_steps <= 0:
+        warmup_steps = max(1, int(0.15 * max_steps))
+    if step <= 0:
+        return 0.0
+    if step >= warmup_steps:
+        return float(lambda_tv)
+    return float(lambda_tv) * (float(step) / float(warmup_steps))
+
+
+def _ramp_weight(step: int, max_steps: int, target: float) -> float:
+    """Auto warmup to avoid over-smoothing early. Warmup = 15% of max_steps."""
+    if target <= 0:
+        return 0.0
+    warmup = max(1, int(0.15 * max_steps))
+    if step <= 0:
+        return 0.0
+    if step >= warmup:
+        return float(target)
+    return float(target) * (float(step) / float(warmup))
+
+
+def _potts_neighbor_disagreement(probs: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """
+    Differentiable Potts-style smoothness:
+    penalty = 1 - sum_k p_i,k * p_j,k for neighbors (i,j).
+
+    probs: (B, K, H, W)
+    valid_mask: optional (B, 1, H, W) in {0,1} (or [0,1]) to gate valid pixels.
+    """
+    agree_v = (probs[:, :, 1:, :] * probs[:, :, :-1, :]).sum(dim=1)  # (B,H-1,W)
+    agree_h = (probs[:, :, :, 1:] * probs[:, :, :, :-1]).sum(dim=1)  # (B,H,W-1)
+    dis_v = 1.0 - agree_v
+    dis_h = 1.0 - agree_h
+    if valid_mask is None:
+        return dis_v.mean() + dis_h.mean()
+    vh = (valid_mask[..., 1:, :] * valid_mask[..., :-1, :]).squeeze(1)
+    vw = (valid_mask[..., :, 1:] * valid_mask[..., :, :-1]).squeeze(1)
+    loss_v = (dis_v * vh).sum() / vh.sum().clamp(min=1.0)
+    loss_h = (dis_h * vw).sum() / vw.sum().clamp(min=1.0)
+    return loss_v + loss_h
+
+
+def _multiscale_smoothness(
+    probs: torch.Tensor, valid_mask: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Multi-scale smoothness on soft probabilities to suppress micro-islands.
+    Returns: (loss_total, loss_tv, loss_potts)
+    """
+    scales = (1, 2, 4)
+    tv_total = torch.zeros((), device=probs.device, dtype=probs.dtype)
+    potts_total = torch.zeros((), device=probs.device, dtype=probs.dtype)
+    count = 0
+
+    for scale in scales:
+        if int(scale) == 1:
+            p = probs
+            v = valid_mask
+        else:
+            k = int(scale)
+            p = F.avg_pool2d(probs, kernel_size=k, stride=k)
+            v = None
+            if valid_mask is not None:
+                v = F.avg_pool2d(valid_mask, kernel_size=k, stride=k)
+                v = (v > 0.5).to(dtype=p.dtype)
+
+        tv_total = tv_total + _tv_anisotropic(p, valid_mask=v)
+        potts_total = potts_total + _potts_neighbor_disagreement(p, valid_mask=v)
+        count += 1
+
+    tv_total = tv_total / float(count)
+    potts_total = potts_total / float(count)
+    total = 0.5 * tv_total + 0.5 * potts_total
+    return total, tv_total, potts_total
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a layout DDPM conditioned on class ratios.")
-    parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML/JSON config file; values act as argparse defaults.",
+    )
+    cfg_args, remaining = base_parser.parse_known_args()
+
+    parser = argparse.ArgumentParser(description="Train a layout DDPM conditioned on class ratios.", parents=[base_parser])
+    parser.add_argument("--data_root", type=str, default=None, help="Root folder for the dataset.")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -64,7 +172,7 @@ def parse_args():
     parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
     parser.add_argument("--base_channels", type=int, default=64, help="Base channel width for the layout UNet.")
     parser.add_argument("--layers_per_block", type=int, default=1, help="Number of layers per UNet block.")
-    parser.add_argument("--train_batch_size", type=int, default=64)
+    parser.add_argument("--train_batch_size", type=int, default=128)
     parser.add_argument("--num_train_epochs", type=int, default=50)
     parser.add_argument("--max_train_steps", type=int, default=200000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -88,6 +196,50 @@ def parse_args():
     parser.add_argument("--checkpoints_total_limit", type=int, default=None)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--lambda_ratio", type=float, default=1.0)
+    parser.add_argument(
+        "--ratio_conditioning",
+        type=str,
+        default="full",
+        choices=["full", "masked"],
+        help="Conditioning type for ratios. Use 'masked' to train with partial ratio constraints.",
+    )
+    parser.add_argument(
+        "--ratio_known_weight",
+        type=float,
+        default=1.0,
+        help="When --ratio_conditioning=masked, weight for known ratios in ratio loss (higher = enforce known more).",
+    )
+    parser.add_argument(
+        "--ratio_unknown_weight",
+        type=float,
+        default=0.0,
+        help="When --ratio_conditioning=masked, weight for unknown ratios in ratio loss (0 disables).",
+    )
+    parser.add_argument(
+        "--p_keep",
+        type=float,
+        default=1.0,
+        help="When --ratio_conditioning=masked, probability each class ratio is revealed during training.",
+    )
+    parser.add_argument(
+        "--known_count_min",
+        type=int,
+        default=1,
+        help="When --ratio_conditioning=masked, enforce at least this many known classes per sample.",
+    )
+    parser.add_argument(
+        "--known_count_max",
+        type=int,
+        default=0,
+        help="When --ratio_conditioning=masked, if >0 enforce at most this many known classes per sample.",
+    )
+    parser.add_argument("--lambda_prior", type=float, default=0.0, help="Optional prior loss weight on unknown ratios.")
+    parser.add_argument(
+        "--ratio_prior_json",
+        type=str,
+        default=None,
+        help="Optional JSON file with a global class-ratio prior (list of K floats).",
+    )
     parser.add_argument("--ratio_temp", type=float, default=1.0)
     parser.add_argument(
         "--ratio_pool",
@@ -100,6 +252,18 @@ def parse_args():
         type=float,
         default=0.0,
         help="Weight for TV smoothness loss on probs. 0 disables.",
+    )
+    parser.add_argument(
+        "--tv_warmup_steps",
+        type=int,
+        default=-1,
+        help="Warmup steps for TV (<=0 means auto: 15%% of max_train_steps).",
+    )
+    parser.add_argument(
+        "--lambda_smooth",
+        type=float,
+        default=0.0,
+        help="Smoothness weight (multi-scale Potts + TV) on soft probabilities. 0 disables.",
     )
     parser.add_argument(
         "--viz_smooth",
@@ -120,7 +284,13 @@ def parse_args():
     )
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--local_rank", type=int, default=-1)
-    args = parser.parse_args()
+    if cfg_args.config:
+        apply_config(parser, cfg_args.config)
+    args = parser.parse_args(remaining)
+    args.config = cfg_args.config
+
+    if args.data_root is None:
+        parser.error("--data_root is required (pass it directly or via --config).")
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -173,6 +343,7 @@ def _log_layout_sample(
     ratio_projector: RatioProjector,
     noise_scheduler: DDPMScheduler,
     ratios: torch.Tensor,
+    known_mask: torch.Tensor | None,
     palette: np.ndarray,
     layout_size: int,
     num_inference_steps: int,
@@ -185,7 +356,12 @@ def _log_layout_sample(
 ) -> None:
     writer = _get_tb_writer(accelerator)
     generator = torch.Generator(device=ratios.device).manual_seed(seed)
-    ratio_emb = ratio_projector(ratios.unsqueeze(0))
+    if getattr(ratio_projector, "input_dim", ratios.shape[0]) != ratios.shape[0]:
+        if known_mask is None:
+            known_mask = torch.ones_like(ratios)
+        ratio_emb = ratio_projector(ratios.unsqueeze(0), known_mask.unsqueeze(0))
+    else:
+        ratio_emb = ratio_projector(ratios.unsqueeze(0))
     layout_latents = torch.randn(
         (1, palette.shape[0], layout_size, layout_size),
         generator=generator,
@@ -211,7 +387,11 @@ def _log_layout_sample(
     weighted = (probs_p * valid_p).sum(dim=(2, 3))
     denom = valid_p.sum(dim=(2, 3)).clamp(min=1.0)
     r_hat = (weighted / denom)[0]
-    ratio_mae = (r_hat.float() - ratios.float()).abs().mean()
+    if known_mask is None:
+        ratio_mae = (r_hat.float() - ratios.float()).abs().mean()
+    else:
+        mask = known_mask.to(dtype=r_hat.dtype)
+        ratio_mae = ((r_hat - ratios).abs() * mask).sum() / mask.sum().clamp(min=1.0)
 
     layout_logits = layout_latents
     if viz_smooth is not None and int(viz_smooth) > 1:
@@ -254,13 +434,36 @@ def main():
     args.num_classes = num_classes
     palette = build_palette(class_names, num_classes, dataset=args.dataset)
 
+    if args.ratio_conditioning == "masked":
+        if int(args.known_count_min) < 1 or int(args.known_count_min) > num_classes:
+            raise ValueError(f"--known_count_min must be in [1, {num_classes}].")
+        if int(args.known_count_max) > 0 and int(args.known_count_max) < int(args.known_count_min):
+            raise ValueError("--known_count_max must be 0 or >= --known_count_min.")
+        if float(args.ratio_known_weight) < 0 or float(args.ratio_unknown_weight) < 0:
+            raise ValueError("--ratio_known_weight/--ratio_unknown_weight must be >= 0.")
+
     train_dataset = _resolve_dataset(args, num_classes)
+    ratio_prior = None
+    if args.ratio_prior_json is not None:
+        prior_path = Path(args.ratio_prior_json)
+        data = json.loads(prior_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "ratio_prior" in data:
+            data = data["ratio_prior"]
+        if not isinstance(data, list):
+            raise ValueError("--ratio_prior_json must be a list or a dict containing 'ratio_prior'.")
+        if len(data) != num_classes:
+            raise ValueError(f"ratio_prior length must be {num_classes}, got {len(data)}.")
+        ratio_prior = torch.tensor([float(x) for x in data], dtype=torch.float32)
+        ratio_prior = torch.clamp(ratio_prior, min=0)
+        ratio_prior = ratio_prior / ratio_prior.sum().clamp(min=1e-8)
 
     def collate_fn(examples):
-        layouts = torch.stack([ex["layout_64"] for ex in examples])
+        layout_key = f"layout_{args.layout_size}"
+        valid_key = f"valid_{args.layout_size}"
+        layouts = torch.stack([ex.get(layout_key, ex["layout_64"]) for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
-        valid64 = torch.stack([ex["valid_64"] for ex in examples])
-        return {"layout_64": layouts, "ratios": ratios, "valid_64": valid64}
+        valids = torch.stack([ex.get(valid_key, ex["valid_64"]) for ex in examples])
+        return {"layouts": layouts, "ratios": ratios, "valids": valids}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -289,7 +492,15 @@ def main():
     )
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
-    ratio_projector = RatioProjector(num_classes, time_embed_dim)
+    if args.ratio_conditioning == "masked":
+        ratio_projector = RatioProjector(
+            num_classes,
+            time_embed_dim,
+            input_dim=2 * num_classes + 1,
+            layer_norm=True,
+        )
+    else:
+        ratio_projector = RatioProjector(num_classes, time_embed_dim)
 
     noise_scheduler = DDPMScheduler(num_train_timesteps=args.num_train_timesteps)
 
@@ -337,14 +548,55 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    def _sample_known_mask(
+        batch_size: int, num_classes: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        p_keep = float(args.p_keep)
+        known_min = int(args.known_count_min)
+        known_max = int(args.known_count_max)
+        if p_keep <= 0.0:
+            mask = torch.zeros((batch_size, num_classes), device=device, dtype=dtype)
+        elif p_keep >= 1.0:
+            mask = torch.ones((batch_size, num_classes), device=device, dtype=dtype)
+        else:
+            mask = (torch.rand((batch_size, num_classes), device=device) < p_keep).to(dtype=dtype)
+
+        if known_max > 0 and known_max < num_classes:
+            for i in range(batch_size):
+                on = torch.nonzero(mask[i] > 0, as_tuple=False).flatten()
+                if on.numel() > known_max:
+                    perm = torch.randperm(on.numel(), device=device)
+                    drop = on[perm[known_max:]]
+                    mask[i, drop] = 0
+
+        if known_min > 0 and known_min <= num_classes:
+            for i in range(batch_size):
+                on = torch.nonzero(mask[i] > 0, as_tuple=False).flatten()
+                if on.numel() >= known_min:
+                    continue
+                off = torch.nonzero(mask[i] <= 0, as_tuple=False).flatten()
+                if off.numel() == 0:
+                    continue
+                need = min(known_min - int(on.numel()), int(off.numel()))
+                perm = torch.randperm(off.numel(), device=device)[:need]
+                mask[i, off[perm]] = 1
+
+        return mask
+
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         ratio_projector.train()
         for batch in train_dataloader:
             with accelerator.accumulate(unet):
-                layouts = batch["layout_64"].to(dtype=weight_dtype)
-                ratios = batch["ratios"].to(dtype=weight_dtype)
-                valid64 = batch["valid_64"].to(dtype=weight_dtype)
+                layouts = batch["layouts"].to(dtype=weight_dtype)
+                valid_mask = batch["valids"].to(dtype=weight_dtype)
+                if layouts.shape[-1] != args.layout_size or layouts.shape[-2] != args.layout_size:
+                    raise ValueError(
+                        f"Layout shape mismatch: got {tuple(layouts.shape)}, expected H=W={int(args.layout_size)}"
+                    )
+                counts = layouts.float().sum(dim=(2, 3))
+                denom = counts.sum(dim=1, keepdim=True).clamp(min=1.0)
+                ratios_true = (counts / denom).to(dtype=weight_dtype)
                 layouts = layouts * 2.0 - 1.0
 
                 noise = torch.randn_like(layouts)
@@ -353,7 +605,14 @@ def main():
                 ).long()
                 noisy_layouts = noise_scheduler.add_noise(layouts, noise, timesteps)
 
-                ratio_emb = ratio_projector(ratios)
+                known_mask = None
+                ratios_obs = ratios_true
+                if args.ratio_conditioning == "masked":
+                    known_mask = _sample_known_mask(layouts.shape[0], num_classes, layouts.device, ratios_true.dtype)
+                    ratios_obs = ratios_true * known_mask
+                    ratio_emb = ratio_projector(ratios_obs, known_mask)
+                else:
+                    ratio_emb = ratio_projector(ratios_true)
                 noise_pred = unet(noisy_layouts, timesteps, class_labels=ratio_emb).sample
                 alphas_cumprod = noise_scheduler.alphas_cumprod.to(noisy_layouts.device)
                 a = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
@@ -362,33 +621,63 @@ def main():
                 x0_pred = (noisy_layouts - sqrt_one_minus_a * noise_pred) / sqrt_a
                 probs = torch.softmax(x0_pred / args.ratio_temp, dim=1)
 
+                smooth_loss = torch.tensor(0.0, device=probs.device)
+                smooth_tv = torch.tensor(0.0, device=probs.device)
+                smooth_potts = torch.tensor(0.0, device=probs.device)
+                smooth_w = 0.0
+                if args.lambda_smooth is not None and float(args.lambda_smooth) > 0:
+                    probs_f = probs.float()
+                    valid_f = valid_mask.float() if valid_mask is not None else None
+                    smooth_loss_f, smooth_tv_f, smooth_potts_f = _multiscale_smoothness(probs_f, valid_mask=valid_f)
+                    smooth_loss = smooth_loss_f.to(dtype=probs.dtype)
+                    smooth_tv = smooth_tv_f.to(dtype=probs.dtype)
+                    smooth_potts = smooth_potts_f.to(dtype=probs.dtype)
+                    smooth_w = _ramp_weight(global_step, args.max_train_steps, float(args.lambda_smooth))
+
                 if args.ratio_pool is not None and int(args.ratio_pool) > 1:
                     k = int(args.ratio_pool)
                     probs_p = F.avg_pool2d(probs, kernel_size=k, stride=k)
-                    valid_p = F.avg_pool2d(valid64, kernel_size=k, stride=k)
+                    valid_p = F.avg_pool2d(valid_mask, kernel_size=k, stride=k)
                 else:
                     probs_p = probs
-                    valid_p = valid64
+                    valid_p = valid_mask
 
                 weighted = (probs_p * valid_p).sum(dim=(2, 3))
                 denom = valid_p.sum(dim=(2, 3)).clamp(min=1.0)
                 r_hat = weighted / denom
-                ratio_loss = F.mse_loss(r_hat.float(), ratios.float(), reduction="mean")
+                if known_mask is None:
+                    ratio_loss = F.mse_loss(r_hat.float(), ratios_true.float(), reduction="mean")
+                    ratio_loss_known = ratio_loss.detach()
+                    ratio_loss_unknown = torch.tensor(0.0, device=r_hat.device)
+                    prior_loss = torch.tensor(0.0, device=r_hat.device)
+                else:
+                    mask_f = known_mask.to(dtype=r_hat.dtype)
+                    unknown_f = (1.0 - mask_f).clamp(min=0.0, max=1.0)
+                    diff2 = (r_hat - ratios_true).float().pow(2)
+                    ratio_loss_known = (diff2 * mask_f.float()).sum() / mask_f.sum().clamp(min=1.0)
+                    ratio_loss_unknown = (diff2 * unknown_f.float()).sum() / unknown_f.sum().clamp(min=1.0)
+                    ratio_loss = float(args.ratio_known_weight) * ratio_loss_known + float(args.ratio_unknown_weight) * ratio_loss_unknown
+                    prior_loss = torch.tensor(0.0, device=r_hat.device)
+                    if ratio_prior is not None and args.lambda_prior is not None and float(args.lambda_prior) > 0:
+                        r_hat_rem = r_hat.float() * unknown_f.float()
+                        r_hat_rem = r_hat_rem / r_hat_rem.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                        p0 = ratio_prior.to(device=r_hat.device, dtype=torch.float32).unsqueeze(0) * unknown_f.float()
+                        p0 = p0 / p0.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                        prior_loss = (r_hat_rem * ((r_hat_rem + 1e-8).log() - (p0 + 1e-8).log())).sum(dim=1).mean()
 
                 tv_loss = torch.tensor(0.0, device=probs.device)
+                tv_w = 0.0
                 if args.lambda_tv is not None and float(args.lambda_tv) > 0:
-                    v = valid64
-                    vh = v[:, :, 1:, :] * v[:, :, :-1, :]
-                    vw = v[:, :, :, 1:] * v[:, :, :, :-1]
-
-                    dh = (probs[:, :, 1:, :] - probs[:, :, :-1, :]).abs()
-                    dw = (probs[:, :, :, 1:] - probs[:, :, :, :-1]).abs()
-
-                    tv_h = (dh * vh).sum() / vh.sum().clamp(min=1.0)
-                    tv_w = (dw * vw).sum() / vw.sum().clamp(min=1.0)
-                    tv_loss = tv_h + tv_w
+                    tv_loss = _tv_anisotropic(probs, valid_mask=valid_mask)
+                    tv_w = _tv_weight(global_step, args.max_train_steps, float(args.lambda_tv), int(args.tv_warmup_steps))
                 denoise_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-                loss = denoise_loss + args.lambda_ratio * ratio_loss + float(args.lambda_tv) * tv_loss
+                loss = (
+                    denoise_loss
+                    + args.lambda_ratio * ratio_loss
+                    + float(args.lambda_prior) * prior_loss
+                    + tv_w * tv_loss
+                    + smooth_w * smooth_loss
+                )
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -406,7 +695,17 @@ def main():
 	                            "train_loss": loss.detach().item(),
 	                            "denoise_loss": denoise_loss.detach().item(),
 	                            "ratio_loss": ratio_loss.detach().item(),
+                                "ratio_loss_known": ratio_loss_known.detach().item(),
+                                "ratio_loss_unknown": ratio_loss_unknown.detach().item(),
+                                "ratio_known_w": float(args.ratio_known_weight),
+                                "ratio_unknown_w": float(args.ratio_unknown_weight),
+                                "prior_loss": prior_loss.detach().item(),
 	                            "tv_loss": tv_loss.detach().item(),
+                                "tv_w": float(tv_w),
+                                "smooth_loss": smooth_loss.detach().item(),
+                                "smooth_tv": smooth_tv.detach().item(),
+                                "smooth_potts": smooth_potts.detach().item(),
+                                "smooth_w": float(smooth_w),
 	                        },
 	                        step=global_step,
 	                    )
@@ -415,7 +714,8 @@ def main():
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
-                        ratios_sample = ratios[0].detach()
+                        ratios_sample = ratios_true[0].detach()
+                        known_mask_sample = known_mask[0].detach() if known_mask is not None else None
                         was_training = unet.training
                         unet.eval()
                         ratio_projector.eval()
@@ -425,6 +725,7 @@ def main():
                             ratio_projector=accelerator.unwrap_model(ratio_projector),
                             noise_scheduler=noise_scheduler,
                             ratios=ratios_sample,
+                            known_mask=known_mask_sample,
                             palette=palette,
                             layout_size=args.layout_size,
                             num_inference_steps=args.sample_num_inference_steps,
@@ -455,6 +756,10 @@ def main():
         with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as handle:
             json.dump(class_names, handle, indent=2)
         with open(os.path.join(args.output_dir, "training_config.json"), "w", encoding="utf-8") as handle:
+            tv_warmup_steps = int(args.tv_warmup_steps)
+            if tv_warmup_steps <= 0:
+                tv_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
+            smooth_warmup_steps = max(1, int(0.15 * int(args.max_train_steps)))
             json.dump(
                 {
                     "dataset": args.dataset,
@@ -466,9 +771,21 @@ def main():
                     "base_channels": args.base_channels,
                     "layers_per_block": args.layers_per_block,
                     "lambda_ratio": args.lambda_ratio,
+                    "ratio_conditioning": args.ratio_conditioning,
+                    "p_keep": args.p_keep,
+                    "known_count_min": args.known_count_min,
+                    "known_count_max": args.known_count_max,
+                    "ratio_known_weight": args.ratio_known_weight,
+                    "ratio_unknown_weight": args.ratio_unknown_weight,
+                    "lambda_prior": args.lambda_prior,
+                    "ratio_prior_json": args.ratio_prior_json,
+                    "ratio_projector_input_dim": getattr(unwrapped_ratio, "input_dim", num_classes),
                     "ratio_temp": args.ratio_temp,
                     "ratio_pool": args.ratio_pool,
                     "lambda_tv": args.lambda_tv,
+                    "tv_warmup_steps": tv_warmup_steps,
+                    "lambda_smooth": args.lambda_smooth,
+                    "smooth_warmup_steps": smooth_warmup_steps,
                     "viz_smooth": args.viz_smooth,
                 },
                 handle,

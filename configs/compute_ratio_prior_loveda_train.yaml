@@ -1,0 +1,11 @@
+data_root: /data/inr/llm/Datasets/LOVEDA
+dataset: loveda
+image_size: 1024
+layout_size: 256
+ignore_index: 255
+loveda_split: Train
+loveda_domains: Urban,Rural
+
+batch_size: 16
+num_workers: 4
+output_path: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/ratio_prior_loveda_train.json

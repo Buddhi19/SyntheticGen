@@ -32,9 +32,11 @@ from diffusers.utils.import_utils import is_xformers_available
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
+    from .config_utils import apply_config
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
+        build_ratio_projector_from_state_dict,
         infer_time_embed_dim_from_config,
     )
 except ImportError:  # direct execution
@@ -42,9 +44,11 @@ except ImportError:  # direct execution
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
+    from src.scripts.config_utils import apply_config
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
+        build_ratio_projector_from_state_dict,
         infer_time_embed_dim_from_config,
     )
 
@@ -58,15 +62,24 @@ if is_wandb_available():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train ControlNet with layout + ratio conditioning.")
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML/JSON config file; values act as argparse defaults.",
+    )
+    cfg_args, remaining = base_parser.parse_known_args()
+
+    parser = argparse.ArgumentParser(description="Train ControlNet with layout + ratio conditioning.", parents=[base_parser])
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        required=True,
+        default=None,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument("--output_dir", type=str, default="outputsV2/controlnet_ratio")
-    parser.add_argument("--data_root", type=str, required=True, help="Root folder for the dataset.")
+    parser.add_argument("--data_root", type=str, default=None, help="Root folder for the dataset.")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -82,6 +95,8 @@ def parse_args():
     parser.add_argument("--loveda_split", type=str, default="Train")
     parser.add_argument("--loveda_domains", type=str, default="Urban,Rural")
     parser.add_argument("--prompt", type=str, default="a high-resolution satellite image")
+    parser.add_argument("--prompt_urban", type=str, default="A realistic remote sensing image of an urban area")
+    parser.add_argument("--prompt_rural", type=str, default="A realistic remote sensing image of a rural area")
     parser.add_argument("--train_batch_size", type=int, default=24)
     parser.add_argument("--num_train_epochs", type=int, default=50)
     parser.add_argument("--max_train_steps", type=int, default=40000)
@@ -189,7 +204,20 @@ def parse_args():
     )
     parser.add_argument("--logging_dir", type=str, default="logs")
     parser.add_argument("--local_rank", type=int, default=-1)
-    args = parser.parse_args()
+    if cfg_args.config:
+        apply_config(parser, cfg_args.config)
+    args = parser.parse_args(remaining)
+    args.config = cfg_args.config
+
+    missing = [
+        name
+        for name in ["pretrained_model_name_or_path", "data_root"]
+        if getattr(args, name) in (None, "")
+    ]
+    if missing:
+        parser.error(
+            f"Missing required arguments: {', '.join('--' + x for x in missing)} (pass them directly or via --config)."
+        )
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -257,6 +285,19 @@ def _set_lora_lr(optimizer, lr_scheduler, group_index: int, lr: float) -> None:
         lr_scheduler.base_lrs[group_index] = lr
 
 
+def _sync_lora_grads(accelerator: Accelerator, lora_params) -> None:
+    if not lora_params:
+        return
+    if accelerator.num_processes <= 1:
+        return
+    if not accelerator.sync_gradients:
+        return
+    for param in lora_params:
+        if param.requires_grad and param.grad is not None:
+            reduced = accelerator.reduce(param.grad, reduction="mean")
+            param.grad.copy_(reduced)
+
+
 def _get_tb_writer(accelerator: Accelerator):
     try:
         tracker = accelerator.get_tracker("tensorboard")
@@ -265,6 +306,19 @@ def _get_tb_writer(accelerator: Accelerator):
     if tracker is None:
         return None
     return getattr(tracker, "writer", None)
+
+
+def _encode_prompt(tokenizer, text_encoder, texts, device, dtype):
+    inputs = tokenizer(
+        texts,
+        padding="max_length",
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        embeds = text_encoder(inputs.input_ids.to(device))[0]
+    return embeds.to(dtype=dtype)
 
 
 def _colorize_labels(label_map: torch.Tensor, palette: np.ndarray) -> np.ndarray:
@@ -302,7 +356,11 @@ def _sample_layout_from_ratios(
     num_classes = int(layout_unet.config.in_channels)
     layout_size = int(layout_unet.config.sample_size)
 
-    ratio_emb = layout_ratio_projector(ratios.unsqueeze(0)).to(dtype=output_dtype)
+    if getattr(layout_ratio_projector, "input_dim", num_classes) == num_classes:
+        ratio_emb = layout_ratio_projector(ratios.unsqueeze(0)).to(dtype=output_dtype)
+    else:
+        known_mask = torch.ones_like(ratios)
+        ratio_emb = layout_ratio_projector(ratios.unsqueeze(0), known_mask.unsqueeze(0)).to(dtype=output_dtype)
     latents = torch.randn(
         (1, num_classes, layout_size, layout_size),
         generator=generator,
@@ -460,7 +518,14 @@ def main():
         layouts = torch.stack([ex["layout_512"] for ex in examples])
         layouts_64 = torch.stack([ex["layout_64"] for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
-        return {"pixel_values": pixel_values, "layout_512": layouts, "layout_64": layouts_64, "ratios": ratios}
+        domains = [ex.get("domain", "") for ex in examples]
+        return {
+            "pixel_values": pixel_values,
+            "layout_512": layouts,
+            "layout_64": layouts_64,
+            "ratios": ratios,
+            "domain": domains,
+        }
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -611,27 +676,10 @@ def main():
         ema_ratio_projector.to(accelerator.device)
         ema_film_gate.to(accelerator.device)
 
-    text_inputs = tokenizer(
-        [args.prompt],
-        padding="max_length",
-        truncation=True,
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    )
-    with torch.no_grad():
-        prompt_embeds = text_encoder(text_inputs.input_ids.to(accelerator.device))[0]
-    prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
-
-    uncond_inputs = tokenizer(
-        [""],
-        padding="max_length",
-        truncation=True,
-        max_length=tokenizer.model_max_length,
-        return_tensors="pt",
-    )
-    with torch.no_grad():
-        uncond_embeds = text_encoder(uncond_inputs.input_ids.to(accelerator.device))[0]
-    uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
+    prompt_embeds_default = _encode_prompt(tokenizer, text_encoder, [args.prompt], accelerator.device, weight_dtype)
+    prompt_embeds_urban = _encode_prompt(tokenizer, text_encoder, [args.prompt_urban], accelerator.device, weight_dtype)
+    prompt_embeds_rural = _encode_prompt(tokenizer, text_encoder, [args.prompt_rural], accelerator.device, weight_dtype)
+    uncond_embeds = _encode_prompt(tokenizer, text_encoder, [""], accelerator.device, weight_dtype)
 
     palette = build_palette(class_names, num_classes, dataset=args.dataset)
 
@@ -647,11 +695,14 @@ def main():
                 f"{layout_unet.config.in_channels} (ckpt) vs {num_classes} (dataset)"
             )
         time_embed_dim_layout = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
-        layout_ratio_projector = RatioProjector(num_classes, time_embed_dim_layout)
         state_path = layout_ckpt / "ratio_projector.bin"
         if not state_path.is_file():
             raise FileNotFoundError(f"Layout ratio_projector not found at {state_path}")
-        layout_ratio_projector.load_state_dict(_safe_torch_load(state_path, map_location="cpu"))
+        layout_ratio_state = _safe_torch_load(state_path, map_location="cpu")
+        layout_ratio_projector = build_ratio_projector_from_state_dict(
+            layout_ratio_state, num_classes=num_classes, embed_dim=time_embed_dim_layout
+        )
+        layout_ratio_projector.load_state_dict(layout_ratio_state)
         layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
         layout_unet.to(accelerator.device, dtype=weight_dtype)
@@ -664,6 +715,15 @@ def main():
     first_epoch = 0
     if args.resume_from_checkpoint:
         accelerator.load_state(args.resume_from_checkpoint)
+        resume_lora_dir = os.path.join(args.resume_from_checkpoint, "unet_lora")
+        if os.path.isdir(resume_lora_dir):
+            unet.load_attn_procs(resume_lora_dir, weight_name=args.lora_weight_name)
+            logger.info("Loaded resumed UNet LoRA from %s (%s)", resume_lora_dir, args.lora_weight_name)
+            unet_lora_params = _get_unet_lora_parameters(unet)
+            for param in unet_lora_params:
+                param.requires_grad_(False)
+            if lora_group_index is not None:
+                optimizer.param_groups[lora_group_index]["params"] = unet_lora_params
         if os.path.basename(args.resume_from_checkpoint).startswith("checkpoint-"):
             global_step = int(os.path.basename(args.resume_from_checkpoint).split("-")[1])
             first_epoch = global_step // num_update_steps_per_epoch
@@ -685,10 +745,12 @@ def main():
 
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+    # Train with LoRA scale = 1.0 (always); use args.lora_scale only for sampling/logging.
     lora_scale = args.lora_scale if args.lora_scale is not None else 1.0
-    lora_cross_kwargs = None
+    lora_cross_kwargs_train = None
+    lora_cross_kwargs_sample = None
     if args.lora_path is not None and float(lora_scale) != 1.0:
-        lora_cross_kwargs = {"scale": float(lora_scale)}
+        lora_cross_kwargs_sample = {"scale": float(lora_scale)}
 
     for epoch in range(first_epoch, args.num_train_epochs):
         controlnet.train()
@@ -703,7 +765,9 @@ def main():
                 bsz = layouts_true.shape[0]
                 use_coarse = (torch.rand((bsz,), device=accelerator.device) < args.mask_mix_prob).view(bsz, 1, 1, 1)
                 layouts = torch.where(use_coarse, layouts_coarse, layouts_true)
-                ratios = batch["ratios"].to(device=accelerator.device, dtype=weight_dtype)
+                counts = layouts.float().sum(dim=(2, 3))
+                denom = counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                ratios = (counts / denom).to(dtype=weight_dtype)
 
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample()
@@ -722,7 +786,23 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 ratio_emb = ratio_projector(ratios)
-                prompt_batch = prompt_embeds.repeat(bsz, 1, 1)
+                domains = batch.get("domain", None)
+                prompt_batch = prompt_embeds_default.repeat(bsz, 1, 1)
+                if isinstance(domains, (list, tuple)) and len(domains) == bsz:
+                    is_urban = torch.tensor(
+                        [str(d).lower().startswith("urb") for d in domains],
+                        device=accelerator.device,
+                        dtype=torch.bool,
+                    )
+                    is_rural = torch.tensor(
+                        [str(d).lower().startswith("rur") for d in domains],
+                        device=accelerator.device,
+                        dtype=torch.bool,
+                    )
+                    if is_urban.any():
+                        prompt_batch[is_urban] = prompt_embeds_urban.repeat(int(is_urban.sum().item()), 1, 1)
+                    if is_rural.any():
+                        prompt_batch[is_rural] = prompt_embeds_rural.repeat(int(is_rural.sum().item()), 1, 1)
                 if args.cfg_dropout_prob and args.cfg_dropout_prob > 0:
                     drop_txt = torch.rand((bsz,), device=accelerator.device) < args.cfg_dropout_prob
                     if drop_txt.any():
@@ -760,7 +840,7 @@ def main():
                     class_labels=ratio_emb,
                     down_block_additional_residuals=down_samples,
                     mid_block_additional_residual=mid_sample,
-                    cross_attention_kwargs=lora_cross_kwargs,
+                    cross_attention_kwargs=lora_cross_kwargs_train,
                 ).sample
 
                 if args.snr_gamma and args.snr_gamma > 0:
@@ -780,11 +860,16 @@ def main():
                     loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
+
+                # Ensure LoRA grads are synchronized across GPUs when LoRA is trainable.
+                if unet_lora_params and any(param.requires_grad for param in unet_lora_params):
+                    _sync_lora_grads(accelerator, unet_lora_params)
+
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        chain(controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()),
-                        args.max_grad_norm,
-                    )
+                    clip_groups = [controlnet.parameters(), ratio_projector.parameters(), film_gate.parameters()]
+                    if unet_lora_params and any(param.requires_grad for param in unet_lora_params):
+                        clip_groups.append(unet_lora_params)
+                    accelerator.clip_grad_norm_(chain(*clip_groups), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -817,8 +902,12 @@ def main():
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
+                        if unet_lora_params:
+                            lora_ckpt_dir = os.path.join(save_path, "unet_lora")
+                            os.makedirs(lora_ckpt_dir, exist_ok=True)
+                            unet.save_attn_procs(lora_ckpt_dir, weight_name=args.lora_weight_name)
                         if layout_sampler is not None:
-                            ratios_sample = _sample_random_ratios_dirichlet(
+                            ratios_requested = _sample_random_ratios_dirichlet(
                                 num_classes=num_classes,
                                 alpha=args.random_ratio_alpha,
                                 seed=args.sample_seed + global_step,
@@ -826,17 +915,24 @@ def main():
                                 dtype=weight_dtype,
                             )
                             layout_unet, layout_ratio_projector, layout_scheduler = layout_sampler
-                            layouts_sample = _sample_layout_from_ratios(
+                            layouts_latents = _sample_layout_from_ratios(
                                 layout_unet=layout_unet,
                                 layout_ratio_projector=layout_ratio_projector,
                                 layout_scheduler=layout_scheduler,
-                                ratios=ratios_sample,
+                                ratios=ratios_requested,
                                 num_inference_steps=args.sample_num_inference_steps_layout,
                                 seed=args.sample_seed + global_step,
                                 output_dtype=weight_dtype,
                             )
+                            layout_ids = layouts_latents.argmax(dim=1)
+                            layouts_sample_small = (
+                                F.one_hot(layout_ids, num_classes=num_classes).permute(0, 3, 1, 2).float()
+                            )
+                            counts = layouts_sample_small.float().sum(dim=(2, 3))
+                            denom = counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                            ratios_sample = (counts / denom)[0].to(dtype=weight_dtype)
                             layouts_sample = F.interpolate(
-                                layouts_sample,
+                                layouts_sample_small,
                                 size=(args.image_size, args.image_size),
                                 mode="nearest",
                             )
@@ -859,7 +955,7 @@ def main():
                             controlnet=accelerator.unwrap_model(controlnet),
                             unet=unet,
                             vae=vae,
-                            prompt_embeds=prompt_embeds,
+                            prompt_embeds=prompt_embeds_default,
                             ratio_projector=accelerator.unwrap_model(ratio_projector),
                             film_gate=accelerator.unwrap_model(film_gate),
                             scheduler=sample_scheduler,
@@ -878,7 +974,12 @@ def main():
                             meta_path = samples_dir / f"random_meta_step_{global_step:06d}.json"
                             meta = {
                                 "prompt": args.prompt,
+                                "prompt_default": args.prompt,
+                                "prompt_urban": args.prompt_urban,
+                                "prompt_rural": args.prompt_rural,
                                 "ratios": [float(x) for x in ratios_sample.detach().cpu().tolist()],
+                                "ratios_requested": [float(x) for x in ratios_requested.detach().cpu().tolist()],
+                                "ratios_used": [float(x) for x in ratios_sample.detach().cpu().tolist()],
                                 "class_names": class_names,
                                 "layout_ckpt_for_sampling": args.layout_ckpt_for_sampling,
                                 "seed": int(args.sample_seed + global_step),
@@ -913,6 +1014,10 @@ def main():
         unwrapped_controlnet.save_pretrained(os.path.join(args.output_dir, "controlnet"))
         torch.save(unwrapped_ratio.state_dict(), os.path.join(args.output_dir, "ratio_projector.bin"))
         torch.save(unwrapped_gate.state_dict(), os.path.join(args.output_dir, "film_gate.bin"))
+        if unet_lora_params:
+            final_lora_dir = os.path.join(args.output_dir, "unet_lora")
+            os.makedirs(final_lora_dir, exist_ok=True)
+            unet.save_attn_procs(final_lora_dir, weight_name=args.lora_weight_name)
         with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as handle:
             json.dump(class_names, handle, indent=2)
         with open(os.path.join(args.output_dir, "training_config.json"), "w", encoding="utf-8") as handle:
@@ -924,6 +1029,9 @@ def main():
                     "layout_size": args.layout_size,
                     "ignore_index": args.ignore_index,
                     "prompt": args.prompt,
+                    "prompt_default": args.prompt,
+                    "prompt_urban": args.prompt_urban,
+                    "prompt_rural": args.prompt_rural,
                     "base_model": args.pretrained_model_name_or_path,
                     "mask_mix_prob": args.mask_mix_prob,
                     "cfg_dropout_prob": args.cfg_dropout_prob,
