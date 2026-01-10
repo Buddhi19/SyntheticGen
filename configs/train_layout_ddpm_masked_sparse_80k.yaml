@@ -24,7 +24,7 @@ add_negative_class: true
 lambda_ratio: 0.08
 ratio_known_weight: 1.0
 ratio_unknown_weight: 0.05
-lambda_ce: 0.3
+lambda_ce: 0.6
 
 lambda_prior: 0.1
 min_unknown_for_prior: 3
@@ -35,12 +35,12 @@ lambda_tv: 0.02
 tv_warmup_steps: 5000
 lambda_smooth: 0.15
 smooth_warmup_steps: 5000
-lambda_ent: 0.02
+lambda_ent: 0.005
 ent_warmup_steps: 5000
 viz_smooth: 5
 
 ratio_temp: 1.0
-ratio_pool: 1
+ratio_pool: 16
 sample_num_inference_steps: 200
 
 seed: 123
