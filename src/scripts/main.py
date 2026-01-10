@@ -7,7 +7,7 @@ from pathlib import Path
 main_dir = Path(__file__).resolve().parents[2]
 
 DEFAULT_DATA_ROOT = "/data/inr/llm/Datasets/LOVEDA"
-DEFAULT_LAYOUT_DIR = os.path.join(str(main_dir), "outputsV2", "layout_ddpm")
+DEFAULT_LAYOUT_DIR = os.path.join(str(main_dir), "outputsV2", "layout_d3pm")
 DEFAULT_CONTROLNET_DIR = os.path.join(str(main_dir), "outputsV2", "controlnet_ratio")
 DEFAULT_SAVE_DIR = os.path.join(str(main_dir), "outputsV2", "synthetic_pairs")
 
@@ -40,7 +40,7 @@ class ARG:
             "--layout_output_dir",
             type=str,
             default=DEFAULT_LAYOUT_DIR,
-            help="Output directory for layout DDPM checkpoints.",
+            help="Output directory for Stage-A layout checkpoints.",
         )
         self.parser.add_argument(
             "--controlnet_output_dir",
@@ -52,7 +52,7 @@ class ARG:
             "--layout_ckpt",
             type=str,
             default=DEFAULT_LAYOUT_DIR,
-            help="Layout DDPM checkpoint directory.",
+            help="Stage-A layout checkpoint directory.",
         )
         self.parser.add_argument(
             "--controlnet_ckpt",
@@ -164,7 +164,7 @@ def _append_if_missing(command, extra_args, flag: str, value: str) -> None:
 def main() -> None:
     args = ARG().parse()
     scripts = {
-        "train_layout": "train_layout_ddpm.py",
+        "train_layout": "train_layout_d3pm.py",
         "train_controlnet": "train_controlnet_ratio.py",
         "sample": "sample_pair.py",
     }

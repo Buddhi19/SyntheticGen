@@ -33,6 +33,7 @@ from diffusers.utils.import_utils import is_xformers_available
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
     from .config_utils import apply_config
+    from ..models.d3pm import D3PMScheduler
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -45,6 +46,7 @@ except ImportError:  # direct execution
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
     from src.scripts.config_utils import apply_config
+    from src.models.d3pm import D3PMScheduler
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -345,7 +347,7 @@ def _sample_random_ratios_dirichlet(num_classes: int, alpha: float, seed: int, d
 def _sample_layout_from_ratios(
     layout_unet: UNet2DModel,
     layout_ratio_projector: RatioProjector,
-    layout_scheduler: DDPMScheduler,
+    layout_scheduler: DDPMScheduler | D3PMScheduler,
     ratios: torch.Tensor,
     num_inference_steps: int,
     seed: int,
@@ -361,6 +363,39 @@ def _sample_layout_from_ratios(
     else:
         known_mask = torch.ones_like(ratios)
         ratio_emb = layout_ratio_projector(ratios.unsqueeze(0), known_mask.unsqueeze(0)).to(dtype=output_dtype)
+
+    layout_scheduler.set_timesteps(int(num_inference_steps), device=device)
+    if isinstance(layout_scheduler, D3PMScheduler):
+        x_t = torch.randint(
+            0,
+            int(num_classes),
+            size=(1, int(layout_size), int(layout_size)),
+            generator=generator,
+            device=device,
+            dtype=torch.long,
+        )
+        timesteps = layout_scheduler.timesteps
+        if timesteps is None:
+            timesteps = torch.tensor([], device=device, dtype=torch.long)
+        with torch.no_grad():
+            for idx, t in enumerate(timesteps):
+                t_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                t_prev = int(timesteps[idx + 1].item()) if idx + 1 < int(timesteps.numel()) else 0
+                x_t_onehot = F.one_hot(x_t, num_classes=num_classes).permute(0, 3, 1, 2).to(dtype=output_dtype)
+                logits_x0 = layout_unet(
+                    x_t_onehot, torch.tensor([t_int], device=device, dtype=torch.long), class_labels=ratio_emb
+                ).sample
+                logp_prev = layout_scheduler.p_theta_posterior_logprobs(
+                    x_t,
+                    t=torch.tensor([t_int], device=device, dtype=torch.long),
+                    logits_x0=logits_x0,
+                    t_prev=torch.tensor([t_prev], device=device, dtype=torch.long),
+                )
+                x_t = layout_scheduler.sample_from_logprobs(logp_prev, generator=generator)
+        layout_ids = x_t
+        onehot = F.one_hot(layout_ids.long(), num_classes=num_classes).permute(0, 3, 1, 2).to(dtype=output_dtype)
+        return onehot
+
     latents = torch.randn(
         (1, num_classes, layout_size, layout_size),
         generator=generator,
@@ -368,7 +403,6 @@ def _sample_layout_from_ratios(
         dtype=output_dtype,
     )
     latents = latents * layout_scheduler.init_noise_sigma
-    layout_scheduler.set_timesteps(int(num_inference_steps), device=device)
     with torch.no_grad():
         for timestep in layout_scheduler.timesteps:
             noise_pred = layout_unet(latents, timestep, class_labels=ratio_emb).sample
@@ -730,7 +764,11 @@ def main():
             layout_ratio_state, num_classes=num_classes, embed_dim=time_embed_dim_layout
         )
         layout_ratio_projector.load_state_dict(layout_ratio_state)
-        layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
+        d3pm_config_path = layout_ckpt / "d3pm_config.json"
+        if d3pm_config_path.is_file():
+            layout_scheduler = D3PMScheduler.from_config(d3pm_config_path, device=accelerator.device)
+        else:
+            layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
         layout_unet.to(accelerator.device, dtype=weight_dtype)
         layout_ratio_projector.to(accelerator.device, dtype=weight_dtype)

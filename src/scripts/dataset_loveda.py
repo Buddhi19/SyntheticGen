@@ -278,19 +278,14 @@ class _SegmentationDataset(Dataset):
 
         if self.return_layouts:
             onehot_512, ratios_full, valid_512 = _label_to_onehot_and_ratios(label, self.num_classes, self.ignore_index)
-            onehot_small = F.interpolate(
-                onehot_512.unsqueeze(0),
+            label_small = F.interpolate(
+                label.unsqueeze(0).unsqueeze(0).float(),
                 size=(self.layout_size, self.layout_size),
                 mode="nearest",
-            ).squeeze(0)
-            valid_small = F.interpolate(
-                valid_512.unsqueeze(0),
-                size=(self.layout_size, self.layout_size),
-                mode="nearest",
-            ).squeeze(0)
-            counts_small = onehot_small.sum(dim=(1, 2))
-            denom_small = counts_small.sum().clamp(min=1.0)
-            ratios_small = counts_small / denom_small
+            ).squeeze(0).squeeze(0).long()
+            onehot_small, ratios_small, valid_small = _label_to_onehot_and_ratios(
+                label_small, self.num_classes, self.ignore_index
+            )
 
             out.update(
                 {
@@ -301,6 +296,7 @@ class _SegmentationDataset(Dataset):
                     "valid_64": valid_small,
                     # Explicit keys (Stage A uses these)
                     f"layout_{self.layout_size}": onehot_small,
+                    f"label_{self.layout_size}": label_small,
                     f"valid_{self.layout_size}": valid_small,
                     "ratios": ratios_full,
                     f"ratios_{self.layout_size}": ratios_small,

@@ -2,7 +2,7 @@
 
 This repo implements a two-stage pipeline:
 
-- Stage A: a ratio-conditioned layout DDPM that generates a multi-class layout (K channels) at 64x64.
+- Stage A: a ratio-conditioned layout D3PM (categorical diffusion) that generates a multi-class label map at `layout_size`.
 - Stage B: Stable Diffusion + ControlNet conditioned on the layout, with FiLM-style ratio gating.
 
 The layout generator enforces class ratios during training (explicit ratio loss), and sampling supports optional histogram guidance.
@@ -60,9 +60,9 @@ Masks should be single-channel label maps (integer class ids) or paletted PNGs.
 All scripts accept `--config` pointing to a YAML/JSON file (keys match CLI arg names). Example configs live in `configs/`.
 
 ```bash
-# Stage A (DDPM) on 2 GPUs (6,7)
+# Stage A (D3PM) on 2 GPUs (6,7)
 CUDA_VISIBLE_DEVICES=6,7 python3 -m accelerate.commands.launch --multi_gpu --num_processes 2 --main_process_port 29507 \
-  src/scripts/train_layout_ddpm.py --config configs/train_layout_ddpm_masked_sparse_80k.yaml
+  src/scripts/train_layout_d3pm.py --config configs/train_layout_d3pm_masked_sparse_80k.yaml
 
 # Ratio prior
 python src/scripts/compute_ratio_prior.py --config configs/compute_ratio_prior_loveda_train.yaml
@@ -72,13 +72,13 @@ CUDA_VISIBLE_DEVICES=6,7 python3 -m accelerate.commands.launch --multi_gpu --num
   src/scripts/train_controlnet_ratio.py --config configs/train_controlnet_ratio_loveda_1024.yaml
 ```
 
-Stage A (layout DDPM):
+Stage A (layout D3PM):
 
 ```bash
-python src/scripts/train_layout_ddpm.py \
+python src/scripts/train_layout_d3pm.py \
   --data_root /path/to/loveda \
   --dataset loveda \
-  --output_dir outputs/layout_ddpm \
+  --output_dir outputs/layout_d3pm \
   --checkpointing_steps 500 \
   --sample_num_inference_steps 50 \
   --lambda_ratio 1.0 \
@@ -94,10 +94,10 @@ python src/scripts/compute_ratio_prior.py \
   --image_size 1024 \
   --output_path outputsV2/ratio_prior.json
 
-python src/scripts/train_layout_ddpm.py \
+python src/scripts/train_layout_d3pm.py \
   --data_root /path/to/loveda \
   --dataset loveda \
-  --output_dir outputs/layout_ddpm_masked \
+  --output_dir outputs/layout_d3pm_masked \
   --image_size 1024 \
   --layout_size 256 \
   --ratio_conditioning masked \
@@ -131,7 +131,7 @@ From scratch (ratios -> layout -> image):
 
 ```bash
 python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_ddpm \
+  --layout_ckpt outputs/layout_d3pm \
   --controlnet_ckpt outputs/controlnet_ratio \
   --base_model /path/to/sd-v1-5 \
   --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
@@ -142,7 +142,7 @@ Sparse ratio constraints (works with Stage A checkpoints trained with `--ratio_c
 
 ```bash
 python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_ddpm_masked \
+  --layout_ckpt outputs/layout_d3pm_masked \
   --controlnet_ckpt outputs/controlnet_ratio \
   --base_model /path/to/sd-v1-5 \
   --ratios "water:0.15,agriculture:0.10" \
@@ -155,13 +155,13 @@ Example (specific checkpoint + single-class ratio):
 CUDA_VISIBLE_DEVICES=7 python src/scripts/sample_pair.py --config configs/sample_pair_ckpt40000_building0.4.yaml
 
 CUDA_VISIBLE_DEVICES=7 python /data/inr/llm/DIFF_CD/Diffusor/SyntheticGen/src/scripts/sample_pair.py \
-  --layout_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV2/layout_ddpm_export_80000 \
-  --controlnet_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV2/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-40000 \
+  --layout_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_d3pm_masked_sparse_80k \
+  --controlnet_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV3/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-40000 \
   --base_model /home/nvidia/.cache/huggingface/hub/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14 \
   --lora_path /data/inr/llm/DIFF_CD/Diffusor/outputsV2/lora_loveda_sd15_r8/checkpoint-29000 \
   --lora_weight_name pytorch_lora_weights.safetensors \
   --lora_scale 1.0 \
-  --save_dir /data/inr/llm/DIFF_CD/Diffusor/outputsV2/results_generator/gpu7 \
+  --save_dir /data/inr/llm/DIFF_CD/Diffusor/outputsV3/results_generator/gpu7 \
   --ratios "building:0.4" \
   --prompt "a high-resolution satellite image" \
   --image_size 1024 \
@@ -180,7 +180,7 @@ Img2img with a provided mask:
 
 ```bash
 python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_ddpm \
+  --layout_ckpt outputs/layout_d3pm \
   --controlnet_ckpt outputs/controlnet_ratio \
   --base_model /path/to/sd-v1-5 \
   --init_image /path/to/image.png \
@@ -194,7 +194,7 @@ Image-only editing (auto mask init):
 
 ```bash
 python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_ddpm \
+  --layout_ckpt outputs/layout_d3pm \
   --controlnet_ckpt outputs/controlnet_ratio \
   --base_model /path/to/sd-v1-5 \
   --init_image /path/to/image.png \
@@ -214,8 +214,9 @@ Ratio control metrics:
 
 ```bash
 python src/scripts/eval_ratio_control.py \
-  --layout_ckpt outputs/layout_ddpm \
-  --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
+  --layout_ckpt outputs/layout_d3pm \
+  --data_root /path/to/loveda \
+  --dataset loveda \
   --num_samples 100
 ```
 

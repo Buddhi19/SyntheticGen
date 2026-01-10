@@ -29,6 +29,7 @@ from diffusers import (
 try:
     from .dataset_loveda import build_palette
     from .config_utils import apply_config
+    from ..models.d3pm import D3PMScheduler
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -43,6 +44,7 @@ except ImportError:  # direct execution
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import build_palette
     from src.scripts.config_utils import apply_config
+    from src.models.d3pm import D3PMScheduler
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -499,7 +501,13 @@ def main():
     layout_size = layout_unet.config.sample_size
     time_embed_dim_layout = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
     layout_ratio_projector = _load_ratio_projector(layout_ckpt, num_classes, time_embed_dim_layout)
-    layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
+    d3pm_config_path = layout_ckpt / "d3pm_config.json"
+    if d3pm_config_path.is_file():
+        layout_scheduler = D3PMScheduler.from_config(d3pm_config_path, device=device)
+        layout_is_d3pm = True
+    else:
+        layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
+        layout_is_d3pm = False
 
     class_names = _load_class_names(args, layout_ckpt, controlnet_root, num_classes)
     ratios_requested, ratios_known_mask = _parse_ratio_constraints(args.ratios, args.ratios_json, num_classes, class_names)
@@ -552,11 +560,22 @@ def main():
         init_mask = init_mask_tensor.to(device)
         layout_onehot_init = _onehot_from_mask(init_mask, num_classes, args.ignore_index, mask_format)
         layout_onehot_init = layout_onehot_init.to(device, dtype=weight_dtype)
-        layout_latents = layout_onehot_init.unsqueeze(0) * 2.0 - 1.0
+        layout_ids_init = layout_onehot_init.argmax(dim=0).to(dtype=torch.long)
+        if layout_is_d3pm:
+            layout_latents = layout_ids_init.unsqueeze(0)
+        else:
+            layout_latents = layout_onehot_init.unsqueeze(0) * 2.0 - 1.0
         _, t_start = _get_strength_timesteps(args.num_inference_steps_layout, args.strength_layout)
         timesteps = layout_scheduler.timesteps[t_start:]
         if len(timesteps) == 0:
             timesteps = []
+        elif layout_is_d3pm:
+            t_init = int(timesteps[0].item()) if isinstance(timesteps[0], torch.Tensor) else int(timesteps[0])
+            layout_latents = layout_scheduler.q_sample(
+                layout_latents,
+                torch.tensor([t_init], device=device, dtype=torch.long),
+                generator=generator,
+            )
         else:
             noise = torch.randn(
                 layout_latents.shape,
@@ -566,33 +585,66 @@ def main():
             )
             layout_latents = layout_scheduler.add_noise(layout_latents, noise, timesteps[0])
     else:
-        layout_latents = torch.randn(
-            (1, num_classes, layout_size, layout_size),
-            generator=generator,
-            device=device,
-            dtype=weight_dtype,
-        )
-        layout_latents = layout_latents * layout_scheduler.init_noise_sigma
         timesteps = layout_scheduler.timesteps
+        if layout_is_d3pm:
+            layout_latents = torch.randint(
+                0,
+                int(num_classes),
+                size=(1, int(layout_size), int(layout_size)),
+                generator=generator,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            layout_latents = torch.randn(
+                (1, num_classes, layout_size, layout_size),
+                generator=generator,
+                device=device,
+                dtype=weight_dtype,
+            )
+            layout_latents = layout_latents * layout_scheduler.init_noise_sigma
 
-    alphas_cumprod = layout_scheduler.alphas_cumprod.to(device=device, dtype=layout_latents.dtype)
-    with torch.no_grad():
-        for timestep in timesteps:
-            noise_pred = layout_unet(layout_latents, timestep, class_labels=ratio_emb_layout).sample
-            if args.hist_guidance_scale > 0:
-                t_index = timestep.long() if isinstance(timestep, torch.Tensor) else int(timestep)
-                alpha_prod = alphas_cumprod[t_index].view(1, 1, 1, 1)
-                sqrt_alpha = alpha_prod.sqrt()
-                sqrt_one_minus = (1 - alpha_prod).sqrt()
-                x0_pred = (layout_latents - sqrt_one_minus * noise_pred) / sqrt_alpha
-                probs = torch.softmax(x0_pred / args.hist_guidance_temp, dim=1)
-                r_hat = probs.mean(dim=(2, 3))
-                delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
-            layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
-            if args.hist_guidance_scale > 0:
-                layout_latents = layout_latents + args.hist_guidance_scale * delta
-
-    layout_ids_64 = layout_latents.argmax(dim=1)
+    if layout_is_d3pm:
+        with torch.no_grad():
+            for idx, t in enumerate(timesteps):
+                t_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                t_prev = int(timesteps[idx + 1].item()) if idx + 1 < len(timesteps) else 0
+                x_t_onehot = F.one_hot(layout_latents, num_classes=num_classes).permute(0, 3, 1, 2).float()
+                x_t_onehot = x_t_onehot.to(device=device, dtype=weight_dtype)
+                logits_x0 = layout_unet(
+                    x_t_onehot, torch.tensor([t_int], device=device, dtype=torch.long), class_labels=ratio_emb_layout
+                ).sample
+                if args.hist_guidance_scale > 0:
+                    probs = torch.softmax(logits_x0 / float(args.hist_guidance_temp), dim=1)
+                    r_hat = probs.mean(dim=(2, 3))
+                    delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
+                    logits_x0 = logits_x0 + float(args.hist_guidance_scale) * delta.to(dtype=logits_x0.dtype)
+                logp_prev = layout_scheduler.p_theta_posterior_logprobs(
+                    layout_latents,
+                    t=torch.tensor([t_int], device=device, dtype=torch.long),
+                    logits_x0=logits_x0,
+                    t_prev=torch.tensor([t_prev], device=device, dtype=torch.long),
+                )
+                layout_latents = layout_scheduler.sample_from_logprobs(logp_prev, generator=generator)
+        layout_ids_64 = layout_latents
+    else:
+        alphas_cumprod = layout_scheduler.alphas_cumprod.to(device=device, dtype=layout_latents.dtype)
+        with torch.no_grad():
+            for timestep in timesteps:
+                noise_pred = layout_unet(layout_latents, timestep, class_labels=ratio_emb_layout).sample
+                if args.hist_guidance_scale > 0:
+                    t_index = timestep.long() if isinstance(timestep, torch.Tensor) else int(timestep)
+                    alpha_prod = alphas_cumprod[t_index].view(1, 1, 1, 1)
+                    sqrt_alpha = alpha_prod.sqrt()
+                    sqrt_one_minus = (1 - alpha_prod).sqrt()
+                    x0_pred = (layout_latents - sqrt_one_minus * noise_pred) / sqrt_alpha
+                    probs = torch.softmax(x0_pred / args.hist_guidance_temp, dim=1)
+                    r_hat = probs.mean(dim=(2, 3))
+                    delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
+                layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
+                if args.hist_guidance_scale > 0:
+                    layout_latents = layout_latents + args.hist_guidance_scale * delta
+        layout_ids_64 = layout_latents.argmax(dim=1)
     layout_onehot_64 = F.one_hot(layout_ids_64, num_classes=num_classes).permute(0, 3, 1, 2).float()
     layout_onehot_512 = F.interpolate(layout_onehot_64, size=(args.image_size, args.image_size), mode="nearest")
     layout_ids_512 = F.interpolate(layout_ids_64.unsqueeze(1).float(), size=(args.image_size, args.image_size), mode="nearest")

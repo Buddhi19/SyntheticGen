@@ -1,6 +1,6 @@
 data_root: /data/inr/llm/Datasets/LOVEDA
 dataset: loveda
-output_dir: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_ddpm_masked_sparse_80k
+output_dir: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_d3pm_masked_sparse_80k
 
 image_size: 1024
 layout_size: 256
