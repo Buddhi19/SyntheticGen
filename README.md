@@ -58,6 +58,7 @@ Masks should be single-channel label maps (integer class ids) or paletted PNGs.
 ## YAML configs
 
 All scripts accept `--config` pointing to a YAML/JSON file (keys match CLI arg names). Example configs live in `configs/`.
+To resume training, set `resume_from_checkpoint` in the YAML to an existing `checkpoint-XXXXX` folder.
 
 ```bash
 # Stage A (D3PM) on 2 GPUs (6,7)

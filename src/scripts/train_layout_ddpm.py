@@ -221,6 +221,23 @@ def parse_args():
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--lambda_ratio", type=float, default=1.0)
     parser.add_argument(
+        "--domain_conditioning",
+        action="store_true",
+        help="Enable LoveDA domain conditioning (urban/rural) by adding a domain embedding to the ratio embedding.",
+    )
+    parser.add_argument(
+        "--domain_cond_scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to the domain embedding before adding to the ratio embedding.",
+    )
+    parser.add_argument(
+        "--num_domains",
+        type=int,
+        default=2,
+        help="Number of domains for domain conditioning (LoveDA: 2).",
+    )
+    parser.add_argument(
         "--ratio_conditioning",
         type=str,
         default="full",
@@ -417,6 +434,9 @@ def _log_layout_sample(
     noise_scheduler: DDPMScheduler,
     ratios: torch.Tensor,
     known_mask: torch.Tensor | None,
+    domain_id: int | None,
+    domain_cond_scale: float,
+    domain_embed: torch.nn.Embedding | None,
     palette: np.ndarray,
     layout_size: int,
     num_inference_steps: int,
@@ -435,18 +455,23 @@ def _log_layout_sample(
         ratio_emb = ratio_projector(ratios.unsqueeze(0), known_mask.unsqueeze(0))
     else:
         ratio_emb = ratio_projector(ratios.unsqueeze(0))
+    cond_emb = ratio_emb
+    if domain_embed is not None and domain_id is not None:
+        dom = torch.tensor([int(domain_id)], device=ratios.device, dtype=torch.long)
+        dom_emb = domain_embed(dom).to(dtype=cond_emb.dtype)
+        cond_emb = cond_emb + float(domain_cond_scale) * dom_emb
     layout_latents = torch.randn(
         (1, palette.shape[0], layout_size, layout_size),
         generator=generator,
         device=ratios.device,
-        dtype=ratio_emb.dtype,
+        dtype=cond_emb.dtype,
     )
     layout_latents = layout_latents * noise_scheduler.init_noise_sigma
     noise_scheduler.set_timesteps(num_inference_steps, device=ratios.device)
     x0_pred_last = None
     with torch.no_grad():
         for timestep in noise_scheduler.timesteps:
-            noise_pred = unet(layout_latents, timestep, class_labels=ratio_emb).sample
+            noise_pred = unet(layout_latents, timestep, class_labels=cond_emb).sample
             out = noise_scheduler.step(noise_pred, timestep, layout_latents)
             layout_latents = out.prev_sample
             if hasattr(out, "pred_original_sample") and out.pred_original_sample is not None:
@@ -541,7 +566,10 @@ def main():
         layouts = torch.stack([ex.get(layout_key, ex["layout_64"]) for ex in examples])
         ratios = torch.stack([ex["ratios"] for ex in examples])
         valids = torch.stack([ex.get(valid_key, ex["valid_64"]) for ex in examples])
-        return {"layouts": layouts, "ratios": ratios, "valids": valids}
+        dom_map = {"urban": 0, "rural": 1}
+        domain_str = [str(ex.get("domain", "urban")).lower() for ex in examples]
+        domain_id = torch.tensor([dom_map.get(d, 0) for d in domain_str], dtype=torch.long)
+        return {"layouts": layouts, "ratios": ratios, "valids": valids, "domain_id": domain_id}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -570,6 +598,9 @@ def main():
     )
 
     time_embed_dim = infer_time_embed_dim_from_config(unet.config.block_out_channels)
+    domain_embed = None
+    if bool(args.domain_conditioning):
+        domain_embed = torch.nn.Embedding(int(args.num_domains), int(time_embed_dim))
     if args.ratio_conditioning == "masked":
         ratio_projector = RatioProjector(
             num_classes,
@@ -585,8 +616,11 @@ def main():
     if args.scale_lr:
         args.learning_rate = args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size
 
+    opt_params = chain(unet.parameters(), ratio_projector.parameters())
+    if domain_embed is not None:
+        opt_params = chain(opt_params, domain_embed.parameters())
     optimizer = torch.optim.AdamW(
-        chain(unet.parameters(), ratio_projector.parameters()),
+        opt_params,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -605,9 +639,14 @@ def main():
         num_training_steps=args.max_train_steps,
     )
 
-    unet, ratio_projector, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, ratio_projector, optimizer, train_dataloader, lr_scheduler
-    )
+    if domain_embed is None:
+        unet, ratio_projector, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, ratio_projector, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        unet, ratio_projector, domain_embed, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, ratio_projector, domain_embed, optimizer, train_dataloader, lr_scheduler
+        )
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -727,7 +766,18 @@ def main():
                     ratio_emb = ratio_projector(ratios_obs, known_mask)
                 else:
                     ratio_emb = ratio_projector(ratios_true)
-                noise_pred = unet(noisy_layouts, timesteps, class_labels=ratio_emb).sample
+
+                cond_emb = ratio_emb
+                if domain_embed is not None:
+                    domain_id = batch.get("domain_id")
+                    if domain_id is None:
+                        domain_id = torch.zeros((layouts.shape[0],), device=layouts.device, dtype=torch.long)
+                    else:
+                        domain_id = domain_id.to(device=layouts.device, dtype=torch.long)
+                    dom_emb = domain_embed(domain_id).to(dtype=cond_emb.dtype)
+                    cond_emb = cond_emb + float(args.domain_cond_scale) * dom_emb
+
+                noise_pred = unet(noisy_layouts, timesteps, class_labels=cond_emb).sample
                 alphas_cumprod = noise_scheduler.alphas_cumprod.to(noisy_layouts.device)
                 a = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
                 sqrt_a = a.sqrt()
@@ -827,7 +877,10 @@ def main():
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(chain(unet.parameters(), ratio_projector.parameters()), args.max_grad_norm)
+                    clip_params = chain(unet.parameters(), ratio_projector.parameters())
+                    if domain_embed is not None:
+                        clip_params = chain(clip_params, domain_embed.parameters())
+                    accelerator.clip_grad_norm_(clip_params, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -866,9 +919,14 @@ def main():
                         accelerator.save_state(save_path)
                         ratios_sample = ratios_true[0].detach()
                         known_mask_sample = known_mask[0].detach() if known_mask is not None else None
+                        domain_id_sample = None
+                        if domain_embed is not None and batch.get("domain_id") is not None:
+                            domain_id_sample = int(batch["domain_id"][0].detach().cpu().item())
                         was_training = unet.training
                         unet.eval()
                         ratio_projector.eval()
+                        if domain_embed is not None:
+                            domain_embed.eval()
                         _log_layout_sample(
                             accelerator=accelerator,
                             unet=accelerator.unwrap_model(unet),
@@ -885,10 +943,15 @@ def main():
                             ratio_pool=args.ratio_pool,
                             ratio_temp=args.ratio_temp,
                             viz_smooth=args.viz_smooth,
+                            domain_id=domain_id_sample,
+                            domain_cond_scale=float(args.domain_cond_scale),
+                            domain_embed=accelerator.unwrap_model(domain_embed) if domain_embed is not None else None,
                         )
                         if was_training:
                             unet.train()
                             ratio_projector.train()
+                            if domain_embed is not None:
+                                domain_embed.train()
 
             if global_step >= args.max_train_steps:
                 break
@@ -900,8 +963,12 @@ def main():
     if accelerator.is_main_process:
         unwrapped_unet = accelerator.unwrap_model(unet)
         unwrapped_ratio = accelerator.unwrap_model(ratio_projector)
+        if domain_embed is not None:
+            unwrapped_domain = accelerator.unwrap_model(domain_embed)
         unwrapped_unet.save_pretrained(os.path.join(args.output_dir, "layout_unet"))
         torch.save(unwrapped_ratio.state_dict(), os.path.join(args.output_dir, "ratio_projector.bin"))
+        if domain_embed is not None:
+            torch.save(unwrapped_domain.state_dict(), os.path.join(args.output_dir, "domain_embed.bin"))
         noise_scheduler.save_pretrained(os.path.join(args.output_dir, "scheduler"))
         with open(os.path.join(args.output_dir, "class_names.json"), "w", encoding="utf-8") as handle:
             json.dump(class_names, handle, indent=2)
@@ -926,6 +993,9 @@ def main():
                     "base_channels": args.base_channels,
                     "layers_per_block": args.layers_per_block,
                     "lambda_ratio": args.lambda_ratio,
+                    "domain_conditioning": bool(args.domain_conditioning),
+                    "domain_cond_scale": float(args.domain_cond_scale),
+                    "num_domains": int(args.num_domains),
                     "ratio_conditioning": args.ratio_conditioning,
                     "p_keep": args.p_keep,
                     "known_count_min": args.known_count_min,

@@ -1,6 +1,6 @@
 data_root: /data/inr/llm/Datasets/LOVEDA
 dataset: loveda
-output_dir: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_d3pm_masked_sparse_80k
+output_dir: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_d3pm_masked_sparse_80k_domain_cond
 
 image_size: 1024
 layout_size: 256
@@ -8,11 +8,17 @@ ignore_index: 255
 loveda_split: Train
 loveda_domains: Urban,Rural
 
+domain_conditioning: true
+domain_cond_scale: 1.0
+num_domains: 2
+
 base_channels: 64
 layers_per_block: 1
-train_batch_size: 80
+train_batch_size: 90
 max_train_steps: 160000
 checkpointing_steps: 1000
+checkpoints_total_limit: null
+resume_from_checkpoint: null
 
 ratio_conditioning: masked
 p_keep: 0.3

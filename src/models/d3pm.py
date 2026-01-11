@@ -131,7 +131,8 @@ class D3PMScheduler:
         diag = a_bar + (1.0 - a_bar) / float(self.K)  # (B,1,1)
         bump = torch.log(diag.clamp(min=1e-12)) - base  # (B,1,1)
         logp = base.unsqueeze(-1).expand(x0.shape[0], x0.shape[1], x0.shape[2], self.K).clone()
-        logp.scatter_add_(-1, x0.to(dtype=torch.long).unsqueeze(-1), bump.unsqueeze(-1))
+        bump_map = bump.expand(x0.shape[0], x0.shape[1], x0.shape[2]).unsqueeze(-1)  # (B,H,W,1)
+        logp.scatter_add_(-1, x0.to(dtype=torch.long).unsqueeze(-1), bump_map)
         return logp
 
     def _log_Q_step_cols(self, x_t: torch.Tensor, t: torch.Tensor, t_prev: torch.Tensor) -> torch.Tensor:
@@ -153,7 +154,8 @@ class D3PMScheduler:
         diag = a_step + (1.0 - a_step) / float(self.K)  # (B,1,1)
         bump = torch.log(diag.clamp(min=1e-12)) - base  # (B,1,1)
         logp = base.unsqueeze(-1).expand(x_t.shape[0], x_t.shape[1], x_t.shape[2], self.K).clone()
-        logp.scatter_add_(-1, x_t.to(dtype=torch.long).unsqueeze(-1), bump.unsqueeze(-1))
+        bump_map = bump.expand(x_t.shape[0], x_t.shape[1], x_t.shape[2]).unsqueeze(-1)  # (B,H,W,1)
+        logp.scatter_add_(-1, x_t.to(dtype=torch.long).unsqueeze(-1), bump_map)
         return logp
 
     def q_posterior_logprobs(
@@ -211,10 +213,10 @@ class D3PMScheduler:
         stacked = []
         for k in range(self.K):
             row = base.unsqueeze(-1).expand(x_t.shape[0], x_t.shape[1], x_t.shape[2], self.K).clone()
-            row[..., k] = row[..., k] + bump.squeeze(-1)
+            row[..., k] = row[..., k] + bump.expand(x_t.shape[0], x_t.shape[1], x_t.shape[2])
             post_logits = log_Qt + row
             post_logp = post_logits - torch.logsumexp(post_logits, dim=-1, keepdim=True)  # (B,H,W,K)
-            stacked.append(torch.log(p_x0[..., k].clamp(min=1e-12)) + post_logp)
+            stacked.append(torch.log(p_x0[..., k].clamp(min=1e-12)).unsqueeze(-1) + post_logp)
         return torch.logsumexp(torch.stack(stacked, dim=0), dim=0)  # (B,H,W,K)
 
     def save_config(self, path: str | Path) -> None:
@@ -233,4 +235,3 @@ class D3PMScheduler:
             beta_end=float(cfg.beta_end),
             device=device,
         )
-
