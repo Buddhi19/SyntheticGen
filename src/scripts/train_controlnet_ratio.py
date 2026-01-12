@@ -33,6 +33,7 @@ from diffusers.utils.import_utils import is_xformers_available
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
     from .config_utils import apply_config
+    from ..models.d3pm import D3PMScheduler
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -45,6 +46,7 @@ except ImportError:  # direct execution
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, build_palette, load_class_names
     from src.scripts.config_utils import apply_config
+    from src.models.d3pm import D3PMScheduler
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -345,7 +347,7 @@ def _sample_random_ratios_dirichlet(num_classes: int, alpha: float, seed: int, d
 def _sample_layout_from_ratios(
     layout_unet: UNet2DModel,
     layout_ratio_projector: RatioProjector,
-    layout_scheduler: DDPMScheduler,
+    layout_scheduler: DDPMScheduler | D3PMScheduler,
     ratios: torch.Tensor,
     num_inference_steps: int,
     seed: int,
@@ -361,6 +363,39 @@ def _sample_layout_from_ratios(
     else:
         known_mask = torch.ones_like(ratios)
         ratio_emb = layout_ratio_projector(ratios.unsqueeze(0), known_mask.unsqueeze(0)).to(dtype=output_dtype)
+
+    layout_scheduler.set_timesteps(int(num_inference_steps), device=device)
+    if isinstance(layout_scheduler, D3PMScheduler):
+        x_t = torch.randint(
+            0,
+            int(num_classes),
+            size=(1, int(layout_size), int(layout_size)),
+            generator=generator,
+            device=device,
+            dtype=torch.long,
+        )
+        timesteps = layout_scheduler.timesteps
+        if timesteps is None:
+            timesteps = torch.tensor([], device=device, dtype=torch.long)
+        with torch.no_grad():
+            for idx, t in enumerate(timesteps):
+                t_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                t_prev = int(timesteps[idx + 1].item()) if idx + 1 < int(timesteps.numel()) else 0
+                x_t_onehot = F.one_hot(x_t, num_classes=num_classes).permute(0, 3, 1, 2).to(dtype=output_dtype)
+                logits_x0 = layout_unet(
+                    x_t_onehot, torch.tensor([t_int], device=device, dtype=torch.long), class_labels=ratio_emb
+                ).sample
+                logp_prev = layout_scheduler.p_theta_posterior_logprobs(
+                    x_t,
+                    t=torch.tensor([t_int], device=device, dtype=torch.long),
+                    logits_x0=logits_x0,
+                    t_prev=torch.tensor([t_prev], device=device, dtype=torch.long),
+                )
+                x_t = layout_scheduler.sample_from_logprobs(logp_prev, generator=generator)
+        layout_ids = x_t
+        onehot = F.one_hot(layout_ids.long(), num_classes=num_classes).permute(0, 3, 1, 2).to(dtype=output_dtype)
+        return onehot
+
     latents = torch.randn(
         (1, num_classes, layout_size, layout_size),
         generator=generator,
@@ -368,7 +403,6 @@ def _sample_layout_from_ratios(
         dtype=output_dtype,
     )
     latents = latents * layout_scheduler.init_noise_sigma
-    layout_scheduler.set_timesteps(int(num_inference_steps), device=device)
     with torch.no_grad():
         for timestep in layout_scheduler.timesteps:
             noise_pred = layout_unet(latents, timestep, class_labels=ratio_emb).sample
@@ -415,13 +449,37 @@ def _log_controlnet_sample(
     palette: np.ndarray,
     num_inference_steps: int,
     lora_scale: float,
-) -> None:
+    prompt_embeds_urban: torch.Tensor | None = None,
+    prompt_embeds_rural: torch.Tensor | None = None,
+    prompt_domain: str | None = None,
+) -> str:
     writer = _get_tb_writer(accelerator)
     generator = torch.Generator(device=layouts.device).manual_seed(seed)
 
+    prompt_tag = "default"
+    prompt_selected = prompt_embeds
+    if prompt_domain is not None:
+        dom = str(prompt_domain).strip().lower()
+        if dom.startswith("urb") and prompt_embeds_urban is not None:
+            prompt_tag = "urban"
+            prompt_selected = prompt_embeds_urban
+        elif dom.startswith("rur") and prompt_embeds_rural is not None:
+            prompt_tag = "rural"
+            prompt_selected = prompt_embeds_rural
+    else:
+        candidates = []
+        if prompt_embeds_urban is not None:
+            candidates.append(("urban", prompt_embeds_urban))
+        if prompt_embeds_rural is not None:
+            candidates.append(("rural", prompt_embeds_rural))
+        if candidates:
+            domain_gen = torch.Generator(device=layouts.device).manual_seed(int(seed) + int(step))
+            idx = int(torch.randint(0, len(candidates), (1,), generator=domain_gen, device=layouts.device).item())
+            prompt_tag, prompt_selected = candidates[idx]
+
     ratio_dtype = next(ratio_projector.parameters()).dtype
     ratios = ratios.to(device=layouts.device, dtype=ratio_dtype)
-    ratio_emb = ratio_projector(ratios.unsqueeze(0)).to(dtype=prompt_embeds.dtype)
+    ratio_emb = ratio_projector(ratios.unsqueeze(0)).to(dtype=prompt_selected.dtype)
     cross_kwargs = None
     if lora_scale is not None and float(lora_scale) != 1.0:
         cross_kwargs = {"scale": float(lora_scale)}
@@ -429,7 +487,7 @@ def _log_controlnet_sample(
         (1, unet.config.in_channels, layouts.shape[-1] // 8, layouts.shape[-1] // 8),
         generator=generator,
         device=layouts.device,
-        dtype=prompt_embeds.dtype,
+        dtype=prompt_selected.dtype,
     )
     latents = latents * scheduler.init_noise_sigma
     scheduler.set_timesteps(num_inference_steps, device=layouts.device)
@@ -439,7 +497,7 @@ def _log_controlnet_sample(
             down_samples, mid_sample = controlnet(
                 latents,
                 timestep,
-                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states=prompt_selected,
                 controlnet_cond=layouts,
                 class_labels=ratio_emb,
                 return_dict=False,
@@ -450,14 +508,14 @@ def _log_controlnet_sample(
             noise_pred = unet(
                 latents,
                 timestep,
-                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states=prompt_selected,
                 class_labels=ratio_emb,
                 down_block_additional_residuals=down_samples,
                 mid_block_additional_residual=mid_sample,
                 cross_attention_kwargs=cross_kwargs,
             ).sample
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
-            latents = latents.to(dtype=prompt_embeds.dtype)
+            latents = latents.to(dtype=prompt_selected.dtype)
 
     image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
 
@@ -474,6 +532,9 @@ def _log_controlnet_sample(
     if writer is not None:
         writer.add_image("samples/image", image_array, step, dataformats="HWC")
         writer.add_image("samples/layout", layout_color, step, dataformats="HWC")
+        writer.add_text("samples/prompt_domain", prompt_tag, step)
+
+    return prompt_tag
 
 
 def main():
@@ -703,7 +764,11 @@ def main():
             layout_ratio_state, num_classes=num_classes, embed_dim=time_embed_dim_layout
         )
         layout_ratio_projector.load_state_dict(layout_ratio_state)
-        layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
+        d3pm_config_path = layout_ckpt / "d3pm_config.json"
+        if d3pm_config_path.is_file():
+            layout_scheduler = D3PMScheduler.from_config(d3pm_config_path, device=accelerator.device)
+        else:
+            layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
 
         layout_unet.to(accelerator.device, dtype=weight_dtype)
         layout_ratio_projector.to(accelerator.device, dtype=weight_dtype)
@@ -950,12 +1015,25 @@ def main():
                             ema_controlnet.copy_to(controlnet.parameters())
                             ema_ratio_projector.copy_to(ratio_projector.parameters())
                             ema_film_gate.copy_to(film_gate.parameters())
-                        _log_controlnet_sample(
+                        sample_prompt_urban = None
+                        sample_prompt_rural = None
+                        if args.dataset == "loveda":
+                            active_domains = [
+                                d.strip().lower() for d in str(args.loveda_domains).split(",") if d.strip()
+                            ]
+                            if any(d.startswith("urb") for d in active_domains):
+                                sample_prompt_urban = prompt_embeds_urban
+                            if any(d.startswith("rur") for d in active_domains):
+                                sample_prompt_rural = prompt_embeds_rural
+
+                        prompt_domain_used = _log_controlnet_sample(
                             accelerator=accelerator,
                             controlnet=accelerator.unwrap_model(controlnet),
                             unet=unet,
                             vae=vae,
                             prompt_embeds=prompt_embeds_default,
+                            prompt_embeds_urban=sample_prompt_urban,
+                            prompt_embeds_rural=sample_prompt_rural,
                             ratio_projector=accelerator.unwrap_model(ratio_projector),
                             film_gate=accelerator.unwrap_model(film_gate),
                             scheduler=sample_scheduler,
@@ -972,11 +1050,17 @@ def main():
                             samples_dir = Path(args.output_dir) / "samples"
                             samples_dir.mkdir(parents=True, exist_ok=True)
                             meta_path = samples_dir / f"random_meta_step_{global_step:06d}.json"
+                            prompt_used = args.prompt
+                            if prompt_domain_used == "urban":
+                                prompt_used = args.prompt_urban
+                            elif prompt_domain_used == "rural":
+                                prompt_used = args.prompt_rural
                             meta = {
-                                "prompt": args.prompt,
+                                "prompt": prompt_used,
                                 "prompt_default": args.prompt,
                                 "prompt_urban": args.prompt_urban,
                                 "prompt_rural": args.prompt_rural,
+                                "prompt_domain_used": prompt_domain_used,
                                 "ratios": [float(x) for x in ratios_sample.detach().cpu().tolist()],
                                 "ratios_requested": [float(x) for x in ratios_requested.detach().cpu().tolist()],
                                 "ratios_used": [float(x) for x in ratios_sample.detach().cpu().tolist()],

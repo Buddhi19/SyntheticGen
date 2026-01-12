@@ -18,12 +18,14 @@ from diffusers import DDPMScheduler, UNet2DModel
 
 try:
     from .dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from ..models.d3pm import D3PMScheduler
     from ..models.ratio_conditioning import RatioProjector, build_ratio_projector_from_state_dict, infer_time_embed_dim_from_config
 except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from src.scripts.dataset_loveda import GenericSegDataset, LoveDADataset, load_class_names
+    from src.models.d3pm import D3PMScheduler
     from src.models.ratio_conditioning import RatioProjector, build_ratio_projector_from_state_dict, infer_time_embed_dim_from_config
 
 
@@ -185,7 +187,13 @@ def main():
     ratio_state = _safe_torch_load(layout_ckpt / "ratio_projector.bin", map_location="cpu")
     ratio_projector = build_ratio_projector_from_state_dict(ratio_state, num_classes=num_classes, embed_dim=time_embed_dim)
     ratio_projector.load_state_dict(ratio_state)
-    scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
+    d3pm_config_path = layout_ckpt / "d3pm_config.json"
+    if d3pm_config_path.is_file():
+        scheduler = D3PMScheduler.from_config(d3pm_config_path, device=device)
+        is_d3pm = True
+    else:
+        scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
+        is_d3pm = False
 
     dataset = _resolve_dataset(args, num_classes, layout_size)
     targets = _collect_ratio_targets(dataset, args.num_samples, layout_size)
@@ -206,26 +214,69 @@ def main():
         else:
             known_mask = torch.ones_like(ratios)
             ratio_emb = ratio_projector(ratios.unsqueeze(0), known_mask.unsqueeze(0))
-        latents = torch.randn(
-            (1, num_classes, layout_size, layout_size),
-            generator=generator,
-            device=device,
-            dtype=ratio_emb.dtype,
-        )
-        latents = latents * scheduler.init_noise_sigma
-        with torch.no_grad():
-            for timestep in scheduler.timesteps:
-                noise_pred = layout_unet(latents, timestep, class_labels=ratio_emb).sample
-                latents = scheduler.step(noise_pred, timestep, latents).prev_sample
-
         valid_mask = valid.to(device=device, dtype=torch.float32).unsqueeze(0)
-        r_hat = compute_pooled_ratios_from_logits(
-            x_logits=latents,
-            valid_mask=valid_mask,
-            ratio_pool=args.ratio_pool,
-            ratio_temp=args.ratio_temp,
-            use_soft=args.use_soft_ratios,
-        )[0]
+        if is_d3pm:
+            x_t = torch.randint(
+                0,
+                int(num_classes),
+                size=(1, int(layout_size), int(layout_size)),
+                generator=generator,
+                device=device,
+                dtype=torch.long,
+            )
+            logits_last = None
+            timesteps = scheduler.timesteps
+            if timesteps is None:
+                timesteps = torch.tensor([], device=device, dtype=torch.long)
+            with torch.no_grad():
+                for idx, t in enumerate(timesteps):
+                    t_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                    t_prev = int(timesteps[idx + 1].item()) if idx + 1 < int(timesteps.numel()) else 0
+                    x_t_onehot = F.one_hot(x_t, num_classes=num_classes).permute(0, 3, 1, 2).float()
+                    logits_x0 = layout_unet(
+                        x_t_onehot, torch.tensor([t_int], device=device, dtype=torch.long), class_labels=ratio_emb
+                    ).sample
+                    logits_last = logits_x0
+                    logp_prev = scheduler.p_theta_posterior_logprobs(
+                        x_t,
+                        t=torch.tensor([t_int], device=device, dtype=torch.long),
+                        logits_x0=logits_x0,
+                        t_prev=torch.tensor([t_prev], device=device, dtype=torch.long),
+                    )
+                    x_t = scheduler.sample_from_logprobs(logp_prev, generator=generator)
+            if args.use_soft_ratios and logits_last is not None:
+                x_logits = logits_last
+                use_soft = True
+            else:
+                x_logits = F.one_hot(x_t, num_classes=num_classes).permute(0, 3, 1, 2).float()
+                use_soft = False
+            r_hat = compute_pooled_ratios_from_logits(
+                x_logits=x_logits,
+                valid_mask=valid_mask,
+                ratio_pool=args.ratio_pool,
+                ratio_temp=args.ratio_temp,
+                use_soft=use_soft,
+            )[0]
+        else:
+            latents = torch.randn(
+                (1, num_classes, layout_size, layout_size),
+                generator=generator,
+                device=device,
+                dtype=ratio_emb.dtype,
+            )
+            latents = latents * scheduler.init_noise_sigma
+            with torch.no_grad():
+                for timestep in scheduler.timesteps:
+                    noise_pred = layout_unet(latents, timestep, class_labels=ratio_emb).sample
+                    latents = scheduler.step(noise_pred, timestep, latents).prev_sample
+
+            r_hat = compute_pooled_ratios_from_logits(
+                x_logits=latents,
+                valid_mask=valid_mask,
+                ratio_pool=args.ratio_pool,
+                ratio_temp=args.ratio_temp,
+                use_soft=args.use_soft_ratios,
+            )[0]
         errors.append((r_hat.detach().cpu() - ratios.detach().cpu()).abs())
 
     error_tensor = torch.stack(errors, dim=0)

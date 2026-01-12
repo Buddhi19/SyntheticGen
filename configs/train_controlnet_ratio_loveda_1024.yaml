@@ -16,6 +16,8 @@ learning_rate: 1.0e-5
 train_batch_size: 12
 max_train_steps: 140000
 checkpointing_steps: 1000
+checkpoints_total_limit: null
+resume_from_checkpoint: null
 
 mask_mix_prob: 0.5
 cfg_dropout_prob: 0.1
@@ -23,14 +25,12 @@ cond_dropout_prob: 0.05
 snr_gamma: 5.0
 noise_offset: 0.0
 
-lora_path: /data/inr/llm/DIFF_CD/Diffusor/outputsV2/lora_loveda_sd15_r8/checkpoint-18000
 lora_weight_name: pytorch_lora_weights.safetensors
 lora_scale: 1.0
 lora_unfreeze_step: -1
 
-layout_ckpt_for_sampling: /data/inr/llm/DIFF_CD/Diffusor/outputsV2/layout_ddpm_export_80000
-sample_num_inference_steps_layout: 50
-sample_num_inference_steps: 30
+sample_num_inference_steps_layout: 200
+sample_num_inference_steps: 50
 
 seed: 123
 mixed_precision: fp16

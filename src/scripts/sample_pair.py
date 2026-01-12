@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -27,8 +28,9 @@ from diffusers import (
 )
 
 try:
-    from .dataset_loveda import build_palette
+    from .dataset_loveda import DEFAULT_LOVEDA_CLASS_NAMES, build_palette
     from .config_utils import apply_config
+    from ..models.d3pm import D3PMScheduler
     from ..models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -41,8 +43,9 @@ except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from src.scripts.dataset_loveda import build_palette
+    from src.scripts.dataset_loveda import DEFAULT_LOVEDA_CLASS_NAMES, build_palette
     from src.scripts.config_utils import apply_config
+    from src.models.d3pm import D3PMScheduler
     from src.models.ratio_conditioning import (
         PerChannelResidualFiLMGate,
         RatioProjector,
@@ -68,6 +71,56 @@ def parse_args():
 
     parser = argparse.ArgumentParser(description="Sample layout and image pairs.", parents=[base_parser])
     parser.add_argument("--layout_ckpt", type=str, default=None, help="Layout DDPM checkpoint directory.")
+    parser.add_argument(
+        "--layout_checkpoint",
+        type=int,
+        default=None,
+        help="Optional layout checkpoint step when --layout_ckpt points to a run dir with checkpoint-XXXXX subfolders.",
+    )
+    parser.add_argument(
+        "--layout_size",
+        type=int,
+        default=None,
+        help="Layout diffusion size (square). Used when loading an intermediate checkpoint (checkpoint-XXXXX).",
+    )
+    parser.add_argument(
+        "--layout_diffusion_type",
+        type=str,
+        default=None,
+        choices=["d3pm", "ddpm"],
+        help="Layout diffusion type when it cannot be inferred from the checkpoint (e.g., intermediate checkpoints).",
+    )
+    parser.add_argument(
+        "--layout_num_train_timesteps",
+        type=int,
+        default=1000,
+        help="Layout diffusion training timesteps (used for intermediate checkpoints).",
+    )
+    parser.add_argument(
+        "--layout_beta_start",
+        type=float,
+        default=1e-4,
+        help="D3PM beta_start (used for intermediate checkpoints when --layout_diffusion_type=d3pm).",
+    )
+    parser.add_argument(
+        "--layout_beta_end",
+        type=float,
+        default=0.02,
+        help="D3PM beta_end (used for intermediate checkpoints when --layout_diffusion_type=d3pm).",
+    )
+    parser.add_argument(
+        "--domain",
+        type=str,
+        default="urban",
+        choices=["urban", "rural"],
+        help="Domain conditioning for Stage-A layout generation.",
+    )
+    parser.add_argument(
+        "--domain_cond_scale",
+        type=float,
+        default=1.0,
+        help="Scale for domain embedding during Stage-A layout generation.",
+    )
     parser.add_argument(
         "--controlnet_ckpt",
         type=str,
@@ -227,6 +280,10 @@ def _load_class_names(args, layout_ckpt: Path, controlnet_ckpt: Path, num_classe
         data = _load_json(candidate)
         if isinstance(data, list):
             return [str(x) for x in data]
+    if int(num_classes) == int(len(DEFAULT_LOVEDA_CLASS_NAMES)):
+        # When sampling from intermediate checkpoints, training_config/class_names.json may not exist yet.
+        # Defaulting to LoveDA class names avoids ratio-name KeyErrors like "building:0.4".
+        return [str(x) for x in DEFAULT_LOVEDA_CLASS_NAMES]
     return [f"class_{i}" for i in range(num_classes)]
 
 
@@ -372,6 +429,196 @@ def _load_ratio_projector(checkpoint_dir: Path, num_classes: int, embed_dim: int
     return projector
 
 
+def _list_checkpoint_steps(run_dir: Path) -> List[int]:
+    if not run_dir.is_dir():
+        return []
+    steps: List[int] = []
+    for child in run_dir.iterdir():
+        if not child.is_dir():
+            continue
+        match = re.match(r"^checkpoint-(\d+)$", child.name)
+        if match:
+            steps.append(int(match.group(1)))
+    return sorted(set(steps))
+
+
+def _resolve_run_and_checkpoint_dir(base_dir: Path, checkpoint: Optional[int], kind: str) -> Tuple[Path, Path]:
+    if base_dir.name.startswith("checkpoint-"):
+        if checkpoint is not None:
+            logger.warning("--%s_checkpoint ignored because --%s_ckpt is already a checkpoint dir: %s", kind, kind, base_dir)
+        return base_dir.parent, base_dir
+
+    steps = _list_checkpoint_steps(base_dir)
+    if steps:
+        run_dir = base_dir
+        step = int(checkpoint) if checkpoint is not None else steps[-1]
+        ckpt_dir = run_dir / f"checkpoint-{step}"
+        if not ckpt_dir.is_dir():
+            raise FileNotFoundError(f"{kind} checkpoint not found: {ckpt_dir}")
+        if checkpoint is None:
+            logger.info("Resolved %s checkpoint to latest: %s", kind, ckpt_dir)
+        else:
+            logger.info("Resolved %s checkpoint to: %s", kind, ckpt_dir)
+        return run_dir, ckpt_dir
+
+    return base_dir, base_dir
+
+
+def _strip_state_dict_prefix(state: Dict[str, torch.Tensor], required_key: str) -> Dict[str, torch.Tensor]:
+    if required_key in state:
+        return state
+    candidates = [k for k in state.keys() if k.endswith(required_key)]
+    if not candidates:
+        return state
+    chosen = min(candidates, key=len)
+    prefix = chosen[: -len(required_key)]
+    stripped = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
+    if stripped:
+        return stripped
+    return state
+
+
+def _infer_unet2d_config_from_state_dict(state: Dict[str, torch.Tensor], sample_size: int) -> Dict:
+    state = _strip_state_dict_prefix(state, "conv_in.weight")
+    if "conv_in.weight" not in state:
+        raise KeyError("Could not find conv_in.weight in UNet checkpoint state dict.")
+
+    conv_in = state["conv_in.weight"]
+    in_channels = int(conv_in.shape[1])
+
+    conv_out = state.get("conv_out.weight")
+    out_channels = int(conv_out.shape[0]) if conv_out is not None else int(in_channels)
+
+    down_block_indices = set()
+    resnet_indices = set()
+    for key in state.keys():
+        m = re.match(r"^down_blocks\.(\d+)\.", key)
+        if m:
+            down_block_indices.add(int(m.group(1)))
+        m = re.match(r"^down_blocks\.0\.resnets\.(\d+)\.", key)
+        if m:
+            resnet_indices.add(int(m.group(1)))
+    if not down_block_indices:
+        raise ValueError("Could not infer down_blocks.* from UNet checkpoint state dict.")
+
+    num_down_blocks = max(down_block_indices) + 1
+    layers_per_block = (max(resnet_indices) + 1) if resnet_indices else 1
+
+    block_out_channels: List[int] = []
+    for i in range(num_down_blocks):
+        for candidate in (
+            f"down_blocks.{i}.resnets.0.conv2.weight",
+            f"down_blocks.{i}.resnets.0.conv1.weight",
+            f"down_blocks.{i}.resnets.0.norm2.weight",
+            f"down_blocks.{i}.resnets.0.norm1.weight",
+        ):
+            tensor = state.get(candidate)
+            if tensor is not None:
+                block_out_channels.append(int(tensor.shape[0]))
+                break
+        else:
+            raise ValueError(f"Could not infer block_out_channels for down_blocks.{i} from checkpoint state dict.")
+
+    return {
+        "sample_size": int(sample_size),
+        "in_channels": int(in_channels),
+        "out_channels": int(out_channels),
+        "layers_per_block": int(layers_per_block),
+        "block_out_channels": tuple(int(x) for x in block_out_channels),
+        "down_block_types": tuple("DownBlock2D" for _ in range(num_down_blocks)),
+        "up_block_types": tuple("UpBlock2D" for _ in range(num_down_blocks)),
+        "class_embed_type": "identity",
+    }
+
+
+def _load_layout_from_checkpoint(
+    ckpt_dir: Path,
+    device: torch.device,
+    layout_size: int,
+    diffusion_type: str,
+    num_train_timesteps: int,
+    beta_start: float,
+    beta_end: float,
+) -> Tuple[UNet2DModel, RatioProjector, object, bool]:
+    unet_state_path = None
+    for candidate in ("model.safetensors", "pytorch_model.bin", "model.bin"):
+        path = ckpt_dir / candidate
+        if path.is_file():
+            unet_state_path = path
+            break
+    if unet_state_path is None:
+        raise FileNotFoundError(f"Could not find UNet weights under {ckpt_dir} (expected model.safetensors).")
+
+    unet_state = _load_state_dict(unet_state_path)
+    unet_state = _strip_state_dict_prefix(unet_state, "conv_in.weight")
+    unet_config = _infer_unet2d_config_from_state_dict(unet_state, sample_size=layout_size)
+    layout_unet = UNet2DModel(**unet_config)
+    layout_unet.load_state_dict(unet_state)
+
+    num_classes = int(layout_unet.config.in_channels)
+    time_embed_dim_layout = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
+
+    ratio_state_path = None
+    for candidate in ("model_1.safetensors", "pytorch_model_1.bin", "model_1.bin"):
+        path = ckpt_dir / candidate
+        if path.is_file():
+            ratio_state_path = path
+            break
+    if ratio_state_path is None:
+        raise FileNotFoundError(f"Could not find ratio projector weights under {ckpt_dir} (expected model_1.safetensors).")
+    ratio_state = _load_state_dict(ratio_state_path)
+    ratio_state = _strip_state_dict_prefix(ratio_state, "net.0.weight")
+    ratio_projector = build_ratio_projector_from_state_dict(ratio_state, num_classes=num_classes, embed_dim=time_embed_dim_layout)
+    ratio_projector.load_state_dict(ratio_state)
+
+    d3pm_cfg = ckpt_dir / "d3pm_config.json"
+    if d3pm_cfg.is_file():
+        layout_scheduler = D3PMScheduler.from_config(d3pm_cfg, device=device)
+        layout_is_d3pm = True
+    else:
+        if diffusion_type == "d3pm":
+            layout_scheduler = D3PMScheduler(
+                num_classes=num_classes,
+                num_timesteps=int(num_train_timesteps),
+                beta_start=float(beta_start),
+                beta_end=float(beta_end),
+                device=device,
+            )
+            layout_is_d3pm = True
+        elif diffusion_type == "ddpm":
+            layout_scheduler = DDPMScheduler(num_train_timesteps=int(num_train_timesteps))
+            layout_is_d3pm = False
+        else:
+            raise ValueError(
+                "Could not infer layout diffusion type from checkpoint; pass --layout_diffusion_type (d3pm|ddpm)."
+            )
+
+    return layout_unet, ratio_projector, layout_scheduler, layout_is_d3pm
+
+
+def _load_domain_embedding(layout_run_dir: Path, layout_ckpt_dir: Path) -> Optional[torch.nn.Embedding]:
+    candidates: List[Path] = []
+    run_path = layout_run_dir / "domain_embed.bin"
+    if run_path.is_file():
+        candidates.append(run_path)
+    for candidate in ("model_2.safetensors", "pytorch_model_2.bin", "model_2.bin"):
+        ckpt_path = layout_ckpt_dir / candidate
+        if ckpt_path.is_file():
+            candidates.append(ckpt_path)
+            break
+
+    for path in candidates:
+        state = _load_state_dict(path)
+        state = _strip_state_dict_prefix(state, "weight")
+        weight = state.get("weight")
+        if weight is None or getattr(weight, "ndim", 0) != 2:
+            raise ValueError(f"Invalid domain embedding checkpoint: {path}")
+        emb = torch.nn.Embedding(int(weight.shape[0]), int(weight.shape[1]))
+        emb.load_state_dict(state)
+        return emb
+    return None
+
+
 def _infer_num_down_residuals(controlnet) -> int:
     if hasattr(controlnet, "controlnet_down_blocks"):
         return len(controlnet.controlnet_down_blocks)
@@ -494,14 +741,44 @@ def main():
         controlnet_root = controlnet_ckpt.parent
         controlnet_state_ckpt = controlnet_ckpt
 
-    layout_unet = UNet2DModel.from_pretrained(layout_ckpt / "layout_unet")
-    num_classes = layout_unet.config.in_channels
-    layout_size = layout_unet.config.sample_size
-    time_embed_dim_layout = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
-    layout_ratio_projector = _load_ratio_projector(layout_ckpt, num_classes, time_embed_dim_layout)
-    layout_scheduler = DDPMScheduler.from_pretrained(layout_ckpt / "scheduler")
+    layout_run_dir, layout_load_dir = _resolve_run_and_checkpoint_dir(layout_ckpt, args.layout_checkpoint, kind="layout")
 
-    class_names = _load_class_names(args, layout_ckpt, controlnet_root, num_classes)
+    if (layout_load_dir / "layout_unet").is_dir():
+        layout_unet = UNet2DModel.from_pretrained(layout_load_dir / "layout_unet")
+        num_classes = layout_unet.config.in_channels
+        layout_size = layout_unet.config.sample_size
+        time_embed_dim_layout = infer_time_embed_dim_from_config(layout_unet.config.block_out_channels)
+        layout_ratio_projector = _load_ratio_projector(layout_load_dir, num_classes, time_embed_dim_layout)
+        d3pm_config_path = layout_load_dir / "d3pm_config.json"
+        if d3pm_config_path.is_file():
+            layout_scheduler = D3PMScheduler.from_config(d3pm_config_path, device=device)
+            layout_is_d3pm = True
+        else:
+            layout_scheduler = DDPMScheduler.from_pretrained(layout_load_dir / "scheduler")
+            layout_is_d3pm = False
+    else:
+        inferred_layout_size = args.layout_size
+        if inferred_layout_size is None:
+            if args.image_size is not None and int(args.image_size) % 4 == 0:
+                inferred_layout_size = int(args.image_size) // 4
+                logger.info("Inferred --layout_size=%d from --image_size=%d (override with --layout_size).", inferred_layout_size, args.image_size)
+            else:
+                inferred_layout_size = 256
+                logger.info("Defaulting --layout_size=%d for checkpoint loading (override with --layout_size).", inferred_layout_size)
+        layout_unet, layout_ratio_projector, layout_scheduler, layout_is_d3pm = _load_layout_from_checkpoint(
+            layout_load_dir,
+            device=device,
+            layout_size=int(inferred_layout_size),
+            diffusion_type=str(args.layout_diffusion_type) if args.layout_diffusion_type is not None else "",
+            num_train_timesteps=int(args.layout_num_train_timesteps),
+            beta_start=float(args.layout_beta_start),
+            beta_end=float(args.layout_beta_end),
+        )
+        num_classes = layout_unet.config.in_channels
+        layout_size = int(inferred_layout_size)
+
+    class_names = _load_class_names(args, layout_run_dir, controlnet_root, num_classes)
+    domain_embed = _load_domain_embedding(layout_run_dir, layout_load_dir)
     ratios_requested, ratios_known_mask = _parse_ratio_constraints(args.ratios, args.ratios_json, num_classes, class_names)
     ratios_full = _impute_full_ratios(ratios_requested, ratios_known_mask, seed=args.seed)
 
@@ -514,6 +791,9 @@ def main():
     layout_ratio_projector.to(device, dtype=weight_dtype)
     layout_unet.eval()
     layout_ratio_projector.eval()
+    if domain_embed is not None:
+        domain_embed.to(device, dtype=weight_dtype)
+        domain_embed.eval()
 
     init_image_tensor = None
     if args.init_image:
@@ -547,16 +827,38 @@ def main():
         ratio_emb_layout = layout_ratio_projector(ratios_layout_device.unsqueeze(0), ratios_layout_mask_device.unsqueeze(0)).to(
             dtype=weight_dtype
         )
+    cond_emb_layout = ratio_emb_layout
+    if domain_embed is not None:
+        dom_map = {"urban": 0, "rural": 1}
+        dom_id = int(dom_map[str(args.domain).lower()])
+        if dom_id >= int(domain_embed.num_embeddings):
+            raise ValueError(
+                f"Domain '{args.domain}' not supported by domain_embed (num_domains={domain_embed.num_embeddings})."
+            )
+        dom = torch.tensor([dom_id], device=device, dtype=torch.long)
+        dom_emb = domain_embed(dom).to(dtype=cond_emb_layout.dtype)
+        cond_emb_layout = cond_emb_layout + float(args.domain_cond_scale) * dom_emb
     layout_scheduler.set_timesteps(args.num_inference_steps_layout, device=device)
     if init_mask_tensor is not None:
         init_mask = init_mask_tensor.to(device)
         layout_onehot_init = _onehot_from_mask(init_mask, num_classes, args.ignore_index, mask_format)
         layout_onehot_init = layout_onehot_init.to(device, dtype=weight_dtype)
-        layout_latents = layout_onehot_init.unsqueeze(0) * 2.0 - 1.0
+        layout_ids_init = layout_onehot_init.argmax(dim=0).to(dtype=torch.long)
+        if layout_is_d3pm:
+            layout_latents = layout_ids_init.unsqueeze(0)
+        else:
+            layout_latents = layout_onehot_init.unsqueeze(0) * 2.0 - 1.0
         _, t_start = _get_strength_timesteps(args.num_inference_steps_layout, args.strength_layout)
         timesteps = layout_scheduler.timesteps[t_start:]
         if len(timesteps) == 0:
             timesteps = []
+        elif layout_is_d3pm:
+            t_init = int(timesteps[0].item()) if isinstance(timesteps[0], torch.Tensor) else int(timesteps[0])
+            layout_latents = layout_scheduler.q_sample(
+                layout_latents,
+                torch.tensor([t_init], device=device, dtype=torch.long),
+                generator=generator,
+            )
         else:
             noise = torch.randn(
                 layout_latents.shape,
@@ -566,33 +868,66 @@ def main():
             )
             layout_latents = layout_scheduler.add_noise(layout_latents, noise, timesteps[0])
     else:
-        layout_latents = torch.randn(
-            (1, num_classes, layout_size, layout_size),
-            generator=generator,
-            device=device,
-            dtype=weight_dtype,
-        )
-        layout_latents = layout_latents * layout_scheduler.init_noise_sigma
         timesteps = layout_scheduler.timesteps
+        if layout_is_d3pm:
+            layout_latents = torch.randint(
+                0,
+                int(num_classes),
+                size=(1, int(layout_size), int(layout_size)),
+                generator=generator,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            layout_latents = torch.randn(
+                (1, num_classes, layout_size, layout_size),
+                generator=generator,
+                device=device,
+                dtype=weight_dtype,
+            )
+            layout_latents = layout_latents * layout_scheduler.init_noise_sigma
 
-    alphas_cumprod = layout_scheduler.alphas_cumprod.to(device=device, dtype=layout_latents.dtype)
-    with torch.no_grad():
-        for timestep in timesteps:
-            noise_pred = layout_unet(layout_latents, timestep, class_labels=ratio_emb_layout).sample
-            if args.hist_guidance_scale > 0:
-                t_index = timestep.long() if isinstance(timestep, torch.Tensor) else int(timestep)
-                alpha_prod = alphas_cumprod[t_index].view(1, 1, 1, 1)
-                sqrt_alpha = alpha_prod.sqrt()
-                sqrt_one_minus = (1 - alpha_prod).sqrt()
-                x0_pred = (layout_latents - sqrt_one_minus * noise_pred) / sqrt_alpha
-                probs = torch.softmax(x0_pred / args.hist_guidance_temp, dim=1)
-                r_hat = probs.mean(dim=(2, 3))
-                delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
-            layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
-            if args.hist_guidance_scale > 0:
-                layout_latents = layout_latents + args.hist_guidance_scale * delta
-
-    layout_ids_64 = layout_latents.argmax(dim=1)
+    if layout_is_d3pm:
+        with torch.no_grad():
+            for idx, t in enumerate(timesteps):
+                t_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+                t_prev = int(timesteps[idx + 1].item()) if idx + 1 < len(timesteps) else 0
+                x_t_onehot = F.one_hot(layout_latents, num_classes=num_classes).permute(0, 3, 1, 2).float()
+                x_t_onehot = x_t_onehot.to(device=device, dtype=weight_dtype)
+                logits_x0 = layout_unet(
+                    x_t_onehot, torch.tensor([t_int], device=device, dtype=torch.long), class_labels=cond_emb_layout
+                ).sample
+                if args.hist_guidance_scale > 0:
+                    probs = torch.softmax(logits_x0 / float(args.hist_guidance_temp), dim=1)
+                    r_hat = probs.mean(dim=(2, 3))
+                    delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
+                    logits_x0 = logits_x0 + float(args.hist_guidance_scale) * delta.to(dtype=logits_x0.dtype)
+                logp_prev = layout_scheduler.p_theta_posterior_logprobs(
+                    layout_latents,
+                    t=torch.tensor([t_int], device=device, dtype=torch.long),
+                    logits_x0=logits_x0,
+                    t_prev=torch.tensor([t_prev], device=device, dtype=torch.long),
+                )
+                layout_latents = layout_scheduler.sample_from_logprobs(logp_prev, generator=generator)
+        layout_ids_64 = layout_latents
+    else:
+        alphas_cumprod = layout_scheduler.alphas_cumprod.to(device=device, dtype=layout_latents.dtype)
+        with torch.no_grad():
+            for timestep in timesteps:
+                noise_pred = layout_unet(layout_latents, timestep, class_labels=cond_emb_layout).sample
+                if args.hist_guidance_scale > 0:
+                    t_index = timestep.long() if isinstance(timestep, torch.Tensor) else int(timestep)
+                    alpha_prod = alphas_cumprod[t_index].view(1, 1, 1, 1)
+                    sqrt_alpha = alpha_prod.sqrt()
+                    sqrt_one_minus = (1 - alpha_prod).sqrt()
+                    x0_pred = (layout_latents - sqrt_one_minus * noise_pred) / sqrt_alpha
+                    probs = torch.softmax(x0_pred / args.hist_guidance_temp, dim=1)
+                    r_hat = probs.mean(dim=(2, 3))
+                    delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
+                layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
+                if args.hist_guidance_scale > 0:
+                    layout_latents = layout_latents + args.hist_guidance_scale * delta
+        layout_ids_64 = layout_latents.argmax(dim=1)
     layout_onehot_64 = F.one_hot(layout_ids_64, num_classes=num_classes).permute(0, 3, 1, 2).float()
     layout_onehot_512 = F.interpolate(layout_onehot_64, size=(args.image_size, args.image_size), mode="nearest")
     layout_ids_512 = F.interpolate(layout_ids_64.unsqueeze(1).float(), size=(args.image_size, args.image_size), mode="nearest")
@@ -801,6 +1136,8 @@ def main():
 
     metadata = {
         "prompt": prompt,
+        "domain": str(args.domain),
+        "domain_cond_scale": float(args.domain_cond_scale),
         "ratios": [float(x) for x in ratios_layout.detach().cpu().tolist()],
         "ratios_known_mask": [float(x) for x in ratios_layout_mask.detach().cpu().tolist()],
         "ratios_requested": [float(x) for x in ratios_requested.detach().cpu().tolist()],

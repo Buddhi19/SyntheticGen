@@ -1,0 +1,53 @@
+data_root: /data/inr/llm/Datasets/LOVEDA
+dataset: loveda
+output_dir: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_d3pm_masked_sparse_80k_domain_cond
+
+image_size: 1024
+layout_size: 256
+ignore_index: 255
+loveda_split: Train
+loveda_domains: Urban,Rural
+
+domain_conditioning: true
+domain_cond_scale: 1.0
+num_domains: 2
+
+base_channels: 64
+layers_per_block: 1
+train_batch_size: 90
+max_train_steps: 160000
+checkpointing_steps: 1000
+checkpoints_total_limit: null
+resume_from_checkpoint: null
+
+ratio_conditioning: masked
+p_keep: 0.3
+known_count_min: 1
+known_count_max: 5
+present_eps: 0.001
+add_negative_class: true
+
+lambda_ratio: 0.08
+ratio_known_weight: 1.0
+ratio_unknown_weight: 0.05
+lambda_ce: 0.6
+
+lambda_prior: 0.1
+min_unknown_for_prior: 3
+min_unknown_mass_for_prior: 0.05
+ratio_prior_json: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/ratio_prior_loveda_train.json
+
+lambda_tv: 0.02
+tv_warmup_steps: 5000
+lambda_smooth: 0.15
+smooth_warmup_steps: 5000
+lambda_ent: 0.005
+ent_warmup_steps: 5000
+viz_smooth: 5
+
+ratio_temp: 1.0
+ratio_pool: 16
+sample_num_inference_steps: 200
+
+seed: 123
+mixed_precision: fp16
