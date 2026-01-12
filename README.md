@@ -153,18 +153,22 @@ python src/scripts/sample_pair.py \
 Example (specific checkpoint + single-class ratio):
 
 ```bash
-CUDA_VISIBLE_DEVICES=7 python src/scripts/sample_pair.py --config configs/sample_pair_ckpt40000_building0.4.yaml
+# Using the YAML config (recommended)
+CUDA_VISIBLE_DEVICES=7 python3 \
+  src/scripts/sample_pair.py --config configs/sample_pair_ckpt40000_building0.4.yaml
 
-CUDA_VISIBLE_DEVICES=7 python /data/inr/llm/DIFF_CD/Diffusor/SyntheticGen/src/scripts/sample_pair.py \
+# Equivalent CLI (for reference)
+CUDA_VISIBLE_DEVICES=7 python3 src/scripts/sample_pair.py \
   --layout_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_d3pm_masked_sparse_80k \
+  --layout_checkpoint 10000 \
+  --layout_diffusion_type d3pm \
+  --domain urban \
+  --domain_cond_scale 1.0 \
   --controlnet_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV3/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-40000 \
   --base_model /home/nvidia/.cache/huggingface/hub/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14 \
-  --lora_path /data/inr/llm/DIFF_CD/Diffusor/outputsV2/lora_loveda_sd15_r8/checkpoint-29000 \
-  --lora_weight_name pytorch_lora_weights.safetensors \
-  --lora_scale 1.0 \
   --save_dir /data/inr/llm/DIFF_CD/Diffusor/outputsV3/results_generator/gpu7 \
   --ratios "building:0.4" \
-  --prompt "a high-resolution satellite image" \
+  --prompt "a high-resolution satellite image of an urban area" \
   --image_size 1024 \
   --num_inference_steps_layout 50 \
   --num_inference_steps_image 30 \

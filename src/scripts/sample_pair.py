@@ -28,7 +28,7 @@ from diffusers import (
 )
 
 try:
-    from .dataset_loveda import build_palette
+    from .dataset_loveda import DEFAULT_LOVEDA_CLASS_NAMES, build_palette
     from .config_utils import apply_config
     from ..models.d3pm import D3PMScheduler
     from ..models.ratio_conditioning import (
@@ -43,7 +43,7 @@ except ImportError:  # direct execution
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from src.scripts.dataset_loveda import build_palette
+    from src.scripts.dataset_loveda import DEFAULT_LOVEDA_CLASS_NAMES, build_palette
     from src.scripts.config_utils import apply_config
     from src.models.d3pm import D3PMScheduler
     from src.models.ratio_conditioning import (
@@ -280,6 +280,10 @@ def _load_class_names(args, layout_ckpt: Path, controlnet_ckpt: Path, num_classe
         data = _load_json(candidate)
         if isinstance(data, list):
             return [str(x) for x in data]
+    if int(num_classes) == int(len(DEFAULT_LOVEDA_CLASS_NAMES)):
+        # When sampling from intermediate checkpoints, training_config/class_names.json may not exist yet.
+        # Defaulting to LoveDA class names avoids ratio-name KeyErrors like "building:0.4".
+        return [str(x) for x in DEFAULT_LOVEDA_CLASS_NAMES]
     return [f"class_{i}" for i in range(num_classes)]
 
 
