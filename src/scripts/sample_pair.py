@@ -210,6 +210,7 @@ def parse_args():
     parser.add_argument("--num_inference_steps_layout", type=int, default=50)
     parser.add_argument("--num_inference_steps_image", type=int, default=30)
     parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=1, help="Number of samples to generate.")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--device", type=str, default="cuda")
@@ -728,6 +729,9 @@ def main():
         logger.warning("CUDA requested but not available. Falling back to CPU.")
         device = torch.device("cpu")
     weight_dtype = resolve_dtype(args.dtype, device)
+    batch_size = int(args.batch_size)
+    if batch_size < 1:
+        raise ValueError("--batch_size must be >= 1")
 
     layout_ckpt = Path(args.layout_ckpt)
     controlnet_ckpt = Path(args.controlnet_ckpt)
@@ -809,12 +813,10 @@ def main():
         init_mask_tensor = _resize_mask(seg_mask, layout_size)
         mask_format = "indexed"
 
-    if getattr(layout_ratio_projector, "input_dim", num_classes) == num_classes:
+    layout_ratio_input_dim = getattr(layout_ratio_projector, "input_dim", num_classes)
+    if layout_ratio_input_dim == num_classes:
         ratios_layout = ratios_full
         ratios_layout_mask = torch.ones_like(ratios_full)
-        ratios_layout_device = ratios_layout.to(device=device, dtype=weight_dtype)
-        ratios_layout_mask_device = ratios_layout_mask.to(device=device, dtype=weight_dtype)
-        ratio_emb_layout = layout_ratio_projector(ratios_layout_device.unsqueeze(0)).to(dtype=weight_dtype)
     else:
         if torch.all(ratios_known_mask > 0):
             ratios_layout = ratios_full
@@ -822,11 +824,14 @@ def main():
         else:
             ratios_layout = ratios_requested
             ratios_layout_mask = ratios_known_mask
-        ratios_layout_device = ratios_layout.to(device=device, dtype=weight_dtype)
-        ratios_layout_mask_device = ratios_layout_mask.to(device=device, dtype=weight_dtype)
-        ratio_emb_layout = layout_ratio_projector(ratios_layout_device.unsqueeze(0), ratios_layout_mask_device.unsqueeze(0)).to(
-            dtype=weight_dtype
-        )
+    ratios_layout_batch = ratios_layout.unsqueeze(0).repeat(batch_size, 1)
+    ratios_layout_mask_batch = ratios_layout_mask.unsqueeze(0).repeat(batch_size, 1)
+    ratios_layout_device = ratios_layout_batch.to(device=device, dtype=weight_dtype)
+    ratios_layout_mask_device = ratios_layout_mask_batch.to(device=device, dtype=weight_dtype)
+    if layout_ratio_input_dim == num_classes:
+        ratio_emb_layout = layout_ratio_projector(ratios_layout_device).to(dtype=weight_dtype)
+    else:
+        ratio_emb_layout = layout_ratio_projector(ratios_layout_device, ratios_layout_mask_device).to(dtype=weight_dtype)
     cond_emb_layout = ratio_emb_layout
     if domain_embed is not None:
         dom_map = {"urban": 0, "rural": 1}
@@ -835,7 +840,7 @@ def main():
             raise ValueError(
                 f"Domain '{args.domain}' not supported by domain_embed (num_domains={domain_embed.num_embeddings})."
             )
-        dom = torch.tensor([dom_id], device=device, dtype=torch.long)
+        dom = torch.full((batch_size,), dom_id, device=device, dtype=torch.long)
         dom_emb = domain_embed(dom).to(dtype=cond_emb_layout.dtype)
         cond_emb_layout = cond_emb_layout + float(args.domain_cond_scale) * dom_emb
     layout_scheduler.set_timesteps(args.num_inference_steps_layout, device=device)
@@ -844,19 +849,22 @@ def main():
         layout_onehot_init = _onehot_from_mask(init_mask, num_classes, args.ignore_index, mask_format)
         layout_onehot_init = layout_onehot_init.to(device, dtype=weight_dtype)
         layout_ids_init = layout_onehot_init.argmax(dim=0).to(dtype=torch.long)
+        layout_ids_init = layout_ids_init.unsqueeze(0).repeat(batch_size, 1, 1)
+        layout_onehot_init = layout_onehot_init.unsqueeze(0).repeat(batch_size, 1, 1, 1)
         if layout_is_d3pm:
-            layout_latents = layout_ids_init.unsqueeze(0)
+            layout_latents = layout_ids_init
         else:
-            layout_latents = layout_onehot_init.unsqueeze(0) * 2.0 - 1.0
+            layout_latents = layout_onehot_init * 2.0 - 1.0
         _, t_start = _get_strength_timesteps(args.num_inference_steps_layout, args.strength_layout)
         timesteps = layout_scheduler.timesteps[t_start:]
         if len(timesteps) == 0:
             timesteps = []
         elif layout_is_d3pm:
             t_init = int(timesteps[0].item()) if isinstance(timesteps[0], torch.Tensor) else int(timesteps[0])
+            t_init_batch = torch.full((batch_size,), t_init, device=device, dtype=torch.long)
             layout_latents = layout_scheduler.q_sample(
                 layout_latents,
-                torch.tensor([t_init], device=device, dtype=torch.long),
+                t_init_batch,
                 generator=generator,
             )
         else:
@@ -873,14 +881,14 @@ def main():
             layout_latents = torch.randint(
                 0,
                 int(num_classes),
-                size=(1, int(layout_size), int(layout_size)),
+                size=(batch_size, int(layout_size), int(layout_size)),
                 generator=generator,
                 device=device,
                 dtype=torch.long,
             )
         else:
             layout_latents = torch.randn(
-                (1, num_classes, layout_size, layout_size),
+                (batch_size, num_classes, layout_size, layout_size),
                 generator=generator,
                 device=device,
                 dtype=weight_dtype,
@@ -892,21 +900,23 @@ def main():
             for idx, t in enumerate(timesteps):
                 t_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
                 t_prev = int(timesteps[idx + 1].item()) if idx + 1 < len(timesteps) else 0
+                t_batch = torch.full((batch_size,), t_int, device=device, dtype=torch.long)
+                t_prev_batch = torch.full((batch_size,), t_prev, device=device, dtype=torch.long)
                 x_t_onehot = F.one_hot(layout_latents, num_classes=num_classes).permute(0, 3, 1, 2).float()
                 x_t_onehot = x_t_onehot.to(device=device, dtype=weight_dtype)
                 logits_x0 = layout_unet(
-                    x_t_onehot, torch.tensor([t_int], device=device, dtype=torch.long), class_labels=cond_emb_layout
+                    x_t_onehot, t_batch, class_labels=cond_emb_layout
                 ).sample
                 if args.hist_guidance_scale > 0:
                     probs = torch.softmax(logits_x0 / float(args.hist_guidance_temp), dim=1)
                     r_hat = probs.mean(dim=(2, 3))
-                    delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
+                    delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(-1, num_classes, 1, 1)
                     logits_x0 = logits_x0 + float(args.hist_guidance_scale) * delta.to(dtype=logits_x0.dtype)
                 logp_prev = layout_scheduler.p_theta_posterior_logprobs(
                     layout_latents,
-                    t=torch.tensor([t_int], device=device, dtype=torch.long),
+                    t=t_batch,
                     logits_x0=logits_x0,
-                    t_prev=torch.tensor([t_prev], device=device, dtype=torch.long),
+                    t_prev=t_prev_batch,
                 )
                 layout_latents = layout_scheduler.sample_from_logprobs(logp_prev, generator=generator)
         layout_ids_64 = layout_latents
@@ -923,7 +933,7 @@ def main():
                     x0_pred = (layout_latents - sqrt_one_minus * noise_pred) / sqrt_alpha
                     probs = torch.softmax(x0_pred / args.hist_guidance_temp, dim=1)
                     r_hat = probs.mean(dim=(2, 3))
-                    delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(1, num_classes, 1, 1)
+                    delta = ((ratios_layout_device - r_hat) * ratios_layout_mask_device).view(-1, num_classes, 1, 1)
                 layout_latents = layout_scheduler.step(noise_pred, timestep, layout_latents).prev_sample
                 if args.hist_guidance_scale > 0:
                     layout_latents = layout_latents + args.hist_guidance_scale * delta
@@ -932,7 +942,7 @@ def main():
     layout_onehot_512 = F.interpolate(layout_onehot_64, size=(args.image_size, args.image_size), mode="nearest")
     layout_ids_512 = F.interpolate(layout_ids_64.unsqueeze(1).float(), size=(args.image_size, args.image_size), mode="nearest")
     layout_ids_512 = layout_ids_512.squeeze(1).long()
-    ratios_generated = layout_onehot_64.mean(dim=(2, 3))[0].detach()
+    ratios_generated = layout_onehot_64.mean(dim=(2, 3)).detach()
     ratios_image_device = ratios_generated.to(device=device, dtype=weight_dtype)
 
     training_config = _load_json(controlnet_root / "training_config.json") or {}
@@ -1013,7 +1023,7 @@ def main():
     film_gate.eval()
 
     text_inputs = tokenizer(
-        [prompt],
+        [prompt] * batch_size,
         padding="max_length",
         truncation=True,
         max_length=tokenizer.model_max_length,
@@ -1024,7 +1034,7 @@ def main():
     prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
 
     uncond_inputs = tokenizer(
-        [""],
+        [""] * batch_size,
         padding="max_length",
         truncation=True,
         max_length=tokenizer.model_max_length,
@@ -1034,7 +1044,7 @@ def main():
         uncond_embeds = text_encoder(uncond_inputs.input_ids.to(device))[0]
     uncond_embeds = uncond_embeds.to(dtype=weight_dtype)
 
-    ratio_emb = ratio_projector(ratios_image_device.unsqueeze(0)).to(dtype=weight_dtype)
+    ratio_emb = ratio_projector(ratios_image_device).to(dtype=weight_dtype)
     layout_cond = layout_onehot_512.to(device=device, dtype=weight_dtype)
     layout_uncond = torch.zeros_like(layout_cond)
     ratio_uncond = torch.zeros_like(ratio_emb)
@@ -1047,6 +1057,8 @@ def main():
         if init_image_tensor is None:
             init_image_tensor = _load_init_image(args.init_image, args.image_size)
         init_image = init_image_tensor.to(device=device, dtype=weight_dtype)
+        if init_image.shape[0] != batch_size:
+            init_image = init_image.repeat(batch_size, 1, 1, 1)
         with torch.no_grad():
             latents = vae.encode(init_image).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
@@ -1064,7 +1076,7 @@ def main():
             latents = scheduler.add_noise(latents, noise, timesteps[0])
     else:
         latents = torch.randn(
-            (1, unet.config.in_channels, args.image_size // 8, args.image_size // 8),
+            (batch_size, unet.config.in_channels, args.image_size // 8, args.image_size // 8),
             generator=generator,
             device=device,
             dtype=weight_dtype,
@@ -1122,33 +1134,51 @@ def main():
 
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
-    image = _vae_decode(vae, latents / vae.config.scaling_factor)[0]
+    images = _vae_decode(vae, latents / vae.config.scaling_factor)
+    if images.ndim == 3:
+        images = images.unsqueeze(0)
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    image_path = Path(args.save_dir) / "image.png"
-    layout_path = Path(args.save_dir) / "layout.png"
-    layout_color_path = Path(args.save_dir) / "layout_color.png"
-    metadata_path = Path(args.save_dir) / "metadata.json"
-    _save_uint8_rgb(image, image_path)
-    _save_label_map(layout_ids_512[0], layout_path)
-    layout_color = _colorize_labels(layout_ids_512[0], palette)
-    Image.fromarray(layout_color, mode="RGB").save(layout_color_path)
+    save_dir = Path(args.save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    metadata_entries = []
+    ratios_layout_list = [float(x) for x in ratios_layout.detach().cpu().tolist()]
+    ratios_layout_mask_list = [float(x) for x in ratios_layout_mask.detach().cpu().tolist()]
+    ratios_requested_list = [float(x) for x in ratios_requested.detach().cpu().tolist()]
+    ratios_known_mask_list = [float(x) for x in ratios_known_mask.detach().cpu().tolist()]
 
-    metadata = {
-        "prompt": prompt,
-        "domain": str(args.domain),
-        "domain_cond_scale": float(args.domain_cond_scale),
-        "ratios": [float(x) for x in ratios_layout.detach().cpu().tolist()],
-        "ratios_known_mask": [float(x) for x in ratios_layout_mask.detach().cpu().tolist()],
-        "ratios_requested": [float(x) for x in ratios_requested.detach().cpu().tolist()],
-        "ratios_requested_mask": [float(x) for x in ratios_known_mask.detach().cpu().tolist()],
-        "ratios_generated": [float(x) for x in ratios_generated.detach().cpu().tolist()],
-        "class_names": class_names,
-        "layout_path": str(layout_path),
-        "layout_color_path": str(layout_color_path),
-        "image_path": str(image_path),
-    }
-    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    for idx in range(batch_size):
+        suffix = "" if batch_size == 1 else f"_{idx:03d}"
+        image_path = save_dir / f"image{suffix}.png"
+        layout_path = save_dir / f"layout{suffix}.png"
+        layout_color_path = save_dir / f"layout_color{suffix}.png"
+        _save_uint8_rgb(images[idx], image_path)
+        _save_label_map(layout_ids_512[idx], layout_path)
+        layout_color = _colorize_labels(layout_ids_512[idx], palette)
+        Image.fromarray(layout_color, mode="RGB").save(layout_color_path)
+
+        metadata = {
+            "prompt": prompt,
+            "domain": str(args.domain),
+            "domain_cond_scale": float(args.domain_cond_scale),
+            "ratios": ratios_layout_list,
+            "ratios_known_mask": ratios_layout_mask_list,
+            "ratios_requested": ratios_requested_list,
+            "ratios_requested_mask": ratios_known_mask_list,
+            "ratios_generated": [float(x) for x in ratios_generated[idx].detach().cpu().tolist()],
+            "class_names": class_names,
+            "layout_path": str(layout_path),
+            "layout_color_path": str(layout_color_path),
+            "image_path": str(image_path),
+        }
+        if batch_size > 1:
+            metadata["sample_index"] = int(idx)
+        metadata_entries.append(metadata)
+
+    metadata_path = save_dir / "metadata.json"
+    if batch_size == 1:
+        metadata_path.write_text(json.dumps(metadata_entries[0], indent=2), encoding="utf-8")
+    else:
+        metadata_path.write_text(json.dumps(metadata_entries, indent=2), encoding="utf-8")
     logger.info(f"Saved outputs under {args.save_dir}")
 
 
