@@ -1,14 +1,14 @@
 layout_ckpt: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_d3pm_masked_sparse_80k_domain_cond
 layout_checkpoint: 79000
 layout_diffusion_type: d3pm
-domain: rural
+domain: urban
 domain_cond_scale: 1.0
-controlnet_ckpt: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-110000
+controlnet_ckpt: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-112000
 base_model: /home/nvidia/.cache/huggingface/hub/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14
 
 save_dir: /data/inr/llm/DIFF_CD/Diffusor/outputsV3/results_generator/gpu7
-ratios: "barren:0.45"
-prompt: A high-resolution satellite image of a rural area
+ratios: "building:0.3"
+prompt: A high-resolution satellite image of an urban area
 
 image_size: 1024
 num_inference_steps_layout: 200
@@ -18,7 +18,7 @@ guidance_rescale: 0.0
 control_scale: 1.0
 lora_scale: 1.0
 
-seed: 123
+seed: 450
 dtype: fp16
 device: cuda:0
 sampler: ddim

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
 import random
 import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -66,8 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size per sample_pair call.")
-    parser.add_argument("--cuda_visible_devices", type=str, default=None)
+    parser.add_argument("--batch_size", type=int, default=6, help="Batch size per sample_pair call.")
+    parser.add_argument("--cuda_visible_devices", type=str, default="7")
     parser.add_argument("--pytorch_cuda_alloc_conf", type=str, default="expandable_segments:True")
     parser.add_argument("--shard_id", type=int, default=0, help="Shard index for multi-process runs.")
     parser.add_argument("--num_shards", type=int, default=1, help="Total shards for multi-process runs.")
@@ -90,6 +90,42 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--beta", type=float, default=0.55, help="Flattening power for non-background classes.")
     parser.add_argument("--gamma", type=float, default=0.7, help="Rarity boost power.")
+    parser.add_argument(
+        "--target_mode",
+        type=str,
+        default="uniform_nonbg",
+        choices=["uniform_nonbg", "custom_json"],
+        help="How to define desired per-image ratios.",
+    )
+    parser.add_argument(
+        "--target_bg",
+        type=float,
+        default=0.20,
+        help="Desired background ratio per image (lower => minorities higher).",
+    )
+    parser.add_argument(
+        "--target_json",
+        type=str,
+        default=None,
+        help="Path to JSON with per-domain target ratios (custom_json).",
+    )
+    parser.add_argument(
+        "--ratios_topk",
+        type=int,
+        default=3,
+        help="How many non-background classes to constrain per sample (in addition to background).",
+    )
+    parser.add_argument(
+        "--accept_ref",
+        type=str,
+        default="target",
+        choices=["target", "real", "none"],
+        help="Acceptance reference distribution for global/KL checks.",
+    )
+    parser.add_argument("--urban_building_min", type=float, default=0.20)
+    parser.add_argument("--rural_building_min", type=float, default=0.10)
+    parser.add_argument("--min_ratio", type=float, default=0.02)
+    parser.add_argument("--max_ratio", type=float, default=0.60)
     parser.add_argument("--max_delta_json", type=str, default=None, help="JSON path for per-class delta caps.")
     parser.add_argument("--focus_abs_tol", type=float, default=0.14)
     parser.add_argument("--global_max_abs", type=float, default=0.42)
@@ -385,20 +421,133 @@ def colorize_mask(mask_idx: np.ndarray) -> np.ndarray:
     return LOVEDA_PALETTE[safe]
 
 
-def make_flat_target(pi: np.ndarray, beta: float, bg_idx: int = 0) -> np.ndarray:
-    pi = np.clip(pi, EPS, 1.0)
-    pi = pi / pi.sum()
-    bg = float(pi[bg_idx])
-    non = pi.copy()
-    non[bg_idx] = 0.0
-    if non.sum() <= 0:
-        return pi
-    non_t = np.power(non / non.sum(), beta)
-    non_t = non_t / non_t.sum()
-    t = np.zeros_like(pi)
-    t[bg_idx] = bg
-    t += (1.0 - bg) * non_t
-    return t / t.sum()
+def load_targets_from_json(path: str) -> Dict[str, np.ndarray]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    # expected: {"rural":{"background":0.2,...}, "urban":{...}}
+    out = {}
+    for dom in ["rural", "urban"]:
+        v = np.zeros(len(CLASS_NAMES), dtype=np.float64)
+        for i, name in enumerate(CLASS_NAMES):
+            v[i] = float(data[dom][name])
+        v = np.clip(v, EPS, 1.0)
+        v = v / v.sum()
+        out[dom] = v
+    return out
+
+
+def compute_target(
+    domain: str,
+    args: argparse.Namespace,
+    cached_custom: Optional[Dict[str, np.ndarray]] = None,
+) -> np.ndarray:
+    if args.target_mode == "custom_json":
+        if cached_custom is None:
+            raise ValueError("--target_mode custom_json requires --target_json")
+        return cached_custom[domain].copy()
+
+    # uniform over non-background with fixed background mass
+    t = np.zeros(len(CLASS_NAMES), dtype=np.float64)
+    bg = float(np.clip(args.target_bg, 0.05, 0.80))
+    t[0] = bg
+    rest = (1.0 - bg) / (len(CLASS_NAMES) - 1)
+    t[1:] = rest
+    return t
+
+
+def _renormalize_requests(
+    req: Dict[int, float],
+    fixed_keys: Optional[Iterable[int]] = None,
+    min_bg: float = 0.05,
+) -> Dict[int, float]:
+    # Ensure requested ratios are feasible; keep fixed keys at requested values.
+    fixed = set(int(k) for k in fixed_keys) if fixed_keys else set()
+    fixed_sum = sum(req[k] for k in req.keys() if k in fixed)
+    variable_keys = [k for k in req.keys() if k not in fixed]
+    if not variable_keys:
+        return req
+
+    remaining = 1.0 - min_bg - fixed_sum
+    if remaining <= 0:
+        for k in variable_keys:
+            req[k] = 0.0
+        return req
+
+    var_sum = sum(req[k] for k in variable_keys)
+    if var_sum <= remaining:
+        return req
+
+    scale = remaining / max(EPS, var_sum)
+    for k in variable_keys:
+        req[k] = float(req[k] * scale)
+    return req
+
+
+def build_ratios_str(
+    domain: str,
+    cur_counts: np.ndarray,
+    plan_total: float,
+    t: np.ndarray,
+    args: argparse.Namespace,
+) -> Tuple[str, Dict[int, float]]:
+    """
+    Always constrain background to target_bg, and constrain top-K deficit non-bg classes.
+    Returns: ratios_str and a dict {class_index: requested_ratio}.
+    """
+    pi = cur_counts / max(EPS, cur_counts.sum())
+    desired = plan_total * t
+    deficit = np.maximum(0.0, desired - cur_counts)  # (K,)
+
+    # Always include background constraint (key for making minorities high)
+    req: Dict[int, float] = {0: float(np.clip(t[0], args.min_ratio, args.max_ratio))}
+    fixed_keys = {0}
+    if domain == "urban":
+        bmin = float(getattr(args, "urban_building_min", 0.20))
+        bmin = float(np.clip(bmin, args.min_ratio, args.max_ratio))
+        base = float(np.clip(max(bmin, float(t[1])), args.min_ratio, args.max_ratio))
+        span = max(0.0, float(args.max_ratio) - base)
+        if span > 0:
+            jitter = min(0.15, span)
+            base = float(base + np.random.uniform(0.0, jitter))
+        req[1] = base
+        fixed_keys = {0, 1}
+    elif domain == "rural":
+        bmin = float(getattr(args, "rural_building_min", 0.10))
+        if bmin > 0.0:
+            bmin = float(np.clip(bmin, args.min_ratio, args.max_ratio))
+            req[1] = float(np.clip(max(bmin, float(t[1])), args.min_ratio, args.max_ratio))
+            fixed_keys = {0, 1}
+
+    # Rank non-background by deficit (optionally with rarity boost)
+    score = deficit.copy()
+    score[0] = 0.0
+    if 1 in fixed_keys:
+        score[1] = 0.0
+    if args.gamma > 0:
+        score *= np.power(np.clip(pi, EPS, 1.0), -float(args.gamma))
+    order = np.argsort(score)[::-1]
+    topk = int(args.ratios_topk)
+    if 1 in fixed_keys:
+        topk = max(1, topk - 1)
+    chosen = [k for k in order if k not in fixed_keys and score[k] > 0][:topk]
+    if not chosen:
+        # fallback: pick smallest-frequency non-bg
+        nonbg = np.arange(1, len(CLASS_NAMES))
+        nonbg = np.array([k for k in nonbg if k not in fixed_keys], dtype=int)
+        if len(nonbg) > 0:
+            chosen = [int(nonbg[np.argmin(pi[nonbg])])]
+
+    for k in chosen:
+        # push class toward target ratio (not the real prior)
+        r = float(t[k])
+        # small stochasticity helps exploration
+        r = float(np.clip(r + np.random.normal(0.0, 0.01), args.min_ratio, args.max_ratio))
+        req[int(k)] = r
+
+    # Make sure constraints are feasible
+    req = _renormalize_requests(req, fixed_keys=fixed_keys, min_bg=0.05)
+
+    ratios_str = ",".join([f"{CLASS_NAMES[k]}:{req[k]:.4f}" for k in sorted(req.keys())])
+    return ratios_str, req
 
 
 def pick_focus_class(deficit: np.ndarray, pi: np.ndarray, gamma: float) -> int:
@@ -440,80 +589,60 @@ def propose_ratio(
 def accept_layout(
     domain: str,
     p: np.ndarray,
-    focus_k: int,
-    r_req: float,
+    req: Dict[int, float],
     mu_real: Dict[str, np.ndarray],
-    focus_abs_tol: float,
-    global_max_abs: float,
-    kl_max: float,
+    t: np.ndarray,
+    args: argparse.Namespace,
 ) -> Tuple[bool, Dict[str, float]]:
-    mu0 = mu_real[domain]
-    max_abs = float(np.max(np.abs(p - mu0)))
-    kl = safe_kl(p, mu0)
-    focus_err = float(abs(p[focus_k] - r_req))
-    ok = (focus_err <= focus_abs_tol) and (max_abs <= global_max_abs) and (kl <= kl_max)
-    return ok, {"max_abs": max_abs, "kl": kl, "focus_err": focus_err}
+    # (i) must satisfy each requested class ratio within tolerance
+    building_min = False
+    if domain == "urban":
+        building_min = True
+    elif domain == "rural" and float(getattr(args, "rural_building_min", 0.0)) > 0.0:
+        building_min = True
+
+    if building_min and 1 in req:
+        if float(p[1]) < float(req[1]):
+            return False, {"building_min": float(req[1]), "building_p": float(p[1])}
+
+    max_req_err = 0.0
+    for k, r in req.items():
+        if building_min and k == 1:
+            continue
+        max_req_err = max(max_req_err, float(abs(p[k] - r)))
+    if max_req_err > float(args.focus_abs_tol):
+        return False, {"max_req_err": max_req_err}
+
+    # (ii) optional global plausibility check
+    if args.accept_ref == "none":
+        return True, {"max_req_err": max_req_err}
+
+    ref = mu_real[domain] if args.accept_ref == "real" else t
+    max_abs = float(np.max(np.abs(p - ref)))
+    kl = safe_kl(p, ref)
+
+    ok = (max_abs <= float(args.global_max_abs)) and (kl <= float(args.kl_max))
+    return ok, {"max_req_err": max_req_err, "max_abs": max_abs, "kl": kl}
 
 
 def run_sample_pair(
-    sample_pair: Path,
-    repo_root: Path,
+    sample_ctx: object,
+    sample_pair_module: object,
+    sample_args: argparse.Namespace,
     tmp_out: Path,
     domain: str,
     ratios_str: str,
     seed: int,
-    args: argparse.Namespace,
-    env: Dict[str, str],
+    prompt: str,
 ) -> None:
-    cmd = [
-        sys.executable,
-        str(sample_pair),
-        "--layout_ckpt",
-        str(args.layout_ckpt),
-        "--layout_checkpoint",
-        str(args.layout_checkpoint),
-        "--layout_diffusion_type",
-        str(args.layout_diffusion_type),
-        "--domain",
-        str(domain),
-        "--domain_cond_scale",
-        str(args.domain_cond_scale),
-        "--controlnet_ckpt",
-        str(args.controlnet_ckpt),
-        "--base_model",
-        str(args.base_model),
-        "--save_dir",
-        str(tmp_out),
-        "--ratios",
-        ratios_str,
-        "--prompt",
-        args.prompt_rural if domain == "rural" else args.prompt_urban,
-        "--image_size",
-        str(args.image_size),
-        "--num_inference_steps_layout",
-        str(args.num_steps_layout),
-        "--num_inference_steps_image",
-        str(args.num_steps_image),
-        "--batch_size",
-        str(args.batch_size),
-        "--guidance_scale",
-        str(args.guidance_scale),
-        "--guidance_rescale",
-        str(args.guidance_rescale),
-        "--control_scale",
-        str(args.control_scale),
-        "--lora_scale",
-        str(args.lora_scale),
-        "--sampler",
-        str(args.sampler),
-        "--seed",
-        str(seed),
-        "--dtype",
-        str(args.dtype),
-        "--device",
-        str(args.device),
-    ]
-    subprocess.run(cmd, cwd=str(repo_root), env=env, check=True)
+    per_call = copy.copy(sample_args)
+    per_call.save_dir = str(tmp_out)
+    per_call.domain = str(domain)
+    per_call.ratios = ratios_str
+    per_call.ratios_json = None
+    per_call.prompt = prompt
+    per_call.seed = int(seed)
+    sample_pair_module.generate_with_context(sample_ctx, per_call)
 
 
 def write_synth_sample(
@@ -624,6 +753,12 @@ def load_batch_outputs(tmp_out: Path) -> List[Dict[str, object]]:
 def main() -> None:
     args = parse_args()
 
+    cached_custom_targets = None
+    if args.target_mode == "custom_json":
+        if not args.target_json:
+            raise ValueError("--target_json is required when --target_mode custom_json")
+        cached_custom_targets = load_targets_from_json(args.target_json)
+
     if args.layout_ckpt is None or args.controlnet_ckpt is None or args.base_model is None:
         raise ValueError("Required: --layout_ckpt, --controlnet_ckpt, and --base_model.")
     if args.batch_size < 1:
@@ -638,9 +773,9 @@ def main() -> None:
     np.random.seed(base_seed)
 
     repo_root = find_repo_root()
-    sample_pair = repo_root / "src" / "scripts" / "sample_pair.py"
-    if not sample_pair.is_file():
-        raise FileNotFoundError(f"sample_pair.py not found: {sample_pair}")
+    sample_pair_path = repo_root / "src" / "scripts" / "sample_pair.py"
+    if not sample_pair_path.is_file():
+        raise FileNotFoundError(f"sample_pair.py not found: {sample_pair_path}")
 
     real_root = resolve_real_root(args.real_root, args.real_split)
     real_r = scan_domain(real_root, "Rural", args.real_mask_format)
@@ -725,11 +860,10 @@ def main() -> None:
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    env = os.environ.copy()
     if args.cuda_visible_devices is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
     if args.pytorch_cuda_alloc_conf:
-        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", str(args.pytorch_cuda_alloc_conf))
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", str(args.pytorch_cuda_alloc_conf))
 
     def choose_domain() -> str:
         if args.only_domain in ("rural", "urban"):
@@ -770,22 +904,74 @@ def main() -> None:
         print("Nothing to generate (synth_total <= 0).")
         return
 
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from src.scripts import sample_pair as sample_pair_module
+
+    sample_argv = [
+        "--layout_ckpt",
+        str(args.layout_ckpt),
+        "--layout_checkpoint",
+        str(args.layout_checkpoint),
+        "--layout_diffusion_type",
+        str(args.layout_diffusion_type),
+        "--domain",
+        "rural",
+        "--domain_cond_scale",
+        str(args.domain_cond_scale),
+        "--controlnet_ckpt",
+        str(args.controlnet_ckpt),
+        "--save_dir",
+        str(tmp_root),
+        "--ratios",
+        "background:0.2",
+        "--prompt",
+        args.prompt_rural,
+        "--image_size",
+        str(args.image_size),
+        "--num_inference_steps_layout",
+        str(args.num_steps_layout),
+        "--num_inference_steps_image",
+        str(args.num_steps_image),
+        "--batch_size",
+        str(args.batch_size),
+        "--guidance_scale",
+        str(args.guidance_scale),
+        "--guidance_rescale",
+        str(args.guidance_rescale),
+        "--control_scale",
+        str(args.control_scale),
+        "--lora_scale",
+        str(args.lora_scale),
+        "--sampler",
+        str(args.sampler),
+        "--seed",
+        str(args.seed),
+        "--dtype",
+        str(args.dtype),
+        "--device",
+        str(args.device),
+    ]
+    if args.base_model:
+        sample_argv.extend(["--base_model", str(args.base_model)])
+
+    sample_args = sample_pair_module.parse_args(sample_argv)
+    sample_ctx = sample_pair_module.build_context(sample_args)
+
     with open(log_path, "a", encoding="utf-8") as flog:
         global_i = 0
         while (accepted["rural"] + accepted["urban"]) < total_to_make:
             domain = choose_domain()
 
-            pi = cur[domain] / max(EPS, cur[domain].sum())
-            t = make_flat_target(pi, args.beta)
             rem = domain_quota[domain] - accepted[domain]
             plan_total = float(cur[domain].sum() + rem * avg_valid_px[domain])
-            deficit = np.maximum(0.0, plan_total * t - cur[domain])
-
-            focus_k = pick_focus_class(deficit, pi, args.gamma)
-            focus_name = CLASS_NAMES[focus_k]
-
-            r_req = propose_ratio(domain, focus_k, t, pi, mu_real, max_delta)
-            ratios_str = f"{focus_name}:{r_req:.4f}"
+            t = compute_target(domain, args, cached_custom_targets)
+            ratios_str, req_dict = build_ratios_str(domain, cur[domain], plan_total, t, args)
+            non_bg = {k: v for k, v in req_dict.items() if k != 0}
+            if non_bg:
+                focus_name = CLASS_NAMES[int(max(non_bg, key=non_bg.get))]
+            else:
+                focus_name = CLASS_NAMES[0]
 
             accepted_in_attempt = 0
             for attempt in range(int(args.max_attempts)):
@@ -797,8 +983,9 @@ def main() -> None:
                 tmp_out.mkdir(parents=True, exist_ok=True)
 
                 try:
-                    run_sample_pair(sample_pair, repo_root, tmp_out, domain, ratios_str, seed, args, env)
-                except subprocess.CalledProcessError as exc:
+                    prompt = args.prompt_rural if domain == "rural" else args.prompt_urban
+                    run_sample_pair(sample_ctx, sample_pair_module, sample_args, tmp_out, domain, ratios_str, seed, prompt)
+                except Exception as exc:
                     record = {
                         "domain": domain,
                         "focus_class": focus_name,
@@ -806,7 +993,8 @@ def main() -> None:
                         "seed": seed,
                         "attempt": attempt,
                         "ok": False,
-                        "error": f"sample_pair_failed:{exc.returncode}",
+                        "error": f"sample_pair_failed:{type(exc).__name__}",
+                        "error_detail": str(exc),
                     }
                     flog.write(json.dumps(record) + "\n")
                     flog.flush()
@@ -845,12 +1033,10 @@ def main() -> None:
                     ok, metrics = accept_layout(
                         domain,
                         p,
-                        focus_k,
-                        r_req,
+                        req_dict,
                         mu_real,
-                        args.focus_abs_tol,
-                        args.global_max_abs,
-                        args.kl_max,
+                        t,
+                        args,
                     )
 
                     record = {
@@ -913,9 +1099,7 @@ def main() -> None:
                     break
 
             if accepted_in_attempt == 0:
-                damp = 0.85
-                ratios_str = f"{focus_name}:{(r_req * damp):.4f}"
-                print(f"Warning: too many rejects for {domain}/{focus_name}. Backing off ratio to {ratios_str}.")
+                print(f"Warning: too many rejects for {domain} with ratios {ratios_str}.")
 
     manifest_path = (
         Path(args.manifest_path).expanduser().resolve()
