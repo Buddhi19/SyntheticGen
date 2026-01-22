@@ -27,16 +27,6 @@
   <img src="docs/results.png" alt="SyntheticGen Results" width="100%">
 </div>
 
----
-
-## 🧭 Pipeline (2-Stage)
-```
-Ratios (+ optional text prompt)
-          |
-[Stage A] Layout D3PM  -> semantic layout
-          |
-[Stage B] ControlNet + FiLM ratio gating -> synthetic image
-```
 
 ---
 
