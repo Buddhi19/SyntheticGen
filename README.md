@@ -1,241 +1,217 @@
-# SyntheticGen: Ratio-Conditioned Layout + ControlNet Image Generation
+<div align="center">
 
-This repo implements a two-stage pipeline:
+# 🎨 SyntheticGen
 
-- Stage A: a ratio-conditioned layout D3PM (categorical diffusion) that generates a multi-class label map at `layout_size`.
-- Stage B: Stable Diffusion + ControlNet conditioned on the layout, with FiLM-style ratio gating.
+### MITIGATING LONG-TAIL BIAS VIN LOVEDA IA PROMPT-CONTROLLED DIFFUSION AUGMENTATION
 
-The layout generator enforces class ratios during training (explicit ratio loss), and sampling supports optional histogram guidance.
+*Addressing class imbalance in remote sensing datasets through controlled synthetic generation*
 
-## Setup
+[![Paper (yet to come)](https://img.shields.io/badge/Paper-arXiv-red)](https://arxiv.org/abs/your-paper-id)
+[![Dataset](https://img.shields.io/badge/Dataset-Google%20Drive-blue)](https://drive.google.com/drive/folders/14cMpLTgvcLdXhRY0kGhFKpDRMvpok90h?usp=sharing)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+</div>
+
+---
+
+## 🌟 Overview
+
+**SyntheticGen** tackles the long-tail distribution problem in the LoveDA remote sensing dataset by generating synthetic imagery with *explicit control* over class ratios. Unlike traditional augmentation methods, our two-stage pipeline lets you specify exactly what proportion of each land cover class should appear in your generated images.
+
+<div align="center">
+  <img src="docs/results.png" alt="SyntheticGen Results" width="100%">
+</div>
+
+
+---
+
+## 🚀 Quick Start
+
+### Installation
 
 ```bash
+# Clone the repository
+git clone https://github.com/Buddhi19/SyntheticGen.git
+cd syntheticgen
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-## Dataset formats
-
-### LoveDA
-Expected structure (either Urban/Rural or a subset):
-
-```
-LoveDA/
-  Train/
-    Train/            # some LoveDA releases have an extra nesting level
-      Urban/
-        images_png/
-        masks_png/
-      Rural/
-        images_png/
-        masks_png/
-    Urban/            # also supported (no extra nesting)
-      images_png/
-      masks_png/
-    Rural/
-      images_png/
-      masks_png/
-  Val/
-    ...
-```
-
-The default class list for LoveDA is used unless you pass `--class_names_json`.
-
-### Generic folder dataset
-Put matching image/mask files under `images/` and `masks/` (filenames must match by stem):
-
-```
-my_data/
-  images/
-    0001.png
-  masks/
-    0001.png
-```
-
-Masks should be single-channel label maps (integer class ids) or paletted PNGs.
-
-## Training
-
-## YAML configs
-
-All scripts accept `--config` pointing to a YAML/JSON file (keys match CLI arg names). Example configs live in `configs/`.
-To resume training, set `resume_from_checkpoint` in the YAML to an existing `checkpoint-XXXXX` folder.
+### Generate Your First Synthetic Image
 
 ```bash
-# Stage A (D3PM) on 2 GPUs (6,7)
-CUDA_VISIBLE_DEVICES=6,7 python3 -m accelerate.commands.launch --multi_gpu --num_processes 2 --main_process_port 29507 \
-  src/scripts/train_layout_d3pm.py --config configs/train_layout_d3pm_masked_sparse_80k.yaml
-
-# Ratio prior
-python src/scripts/compute_ratio_prior.py --config configs/compute_ratio_prior_loveda_train.yaml
-
-# Stage B (ControlNet)
-CUDA_VISIBLE_DEVICES=6,7 python3 -m accelerate.commands.launch --multi_gpu --num_processes 2 --main_process_port 29509 \
-  src/scripts/train_controlnet_ratio.py --config configs/train_controlnet_ratio_loveda_1024.yaml
+# Use a pre-configured example
+python src/scripts/sample_pair.py \
+  --config configs/sample_pair_ckpt40000_building0.4.yaml
 ```
+---
 
-Stage A (layout D3PM):
+## 📚 Usage
+
+### Training Pipeline
+
+#### Step 1: Train Layout Generator (Stage A)
+
+Train the D3PM model to generate semantic layouts conditioned on class ratios:
 
 ```bash
 python src/scripts/train_layout_d3pm.py \
-  --data_root /path/to/loveda \
-  --dataset loveda \
-  --output_dir outputs/layout_d3pm \
-  --checkpointing_steps 500 \
-  --sample_num_inference_steps 50 \
-  --lambda_ratio 1.0 \
-  --ratio_temp 1.0
+  --config configs/train_layout_d3pm_masked_sparse_80k.yaml
 ```
 
-Optional: train Stage A with sparse (partial) ratio conditioning:
+#### Step 2: Compute Ratio Prior (Optional)
+
+For sparse ratio conditioning, compute statistics from your training set:
 
 ```bash
 python src/scripts/compute_ratio_prior.py \
-  --data_root /path/to/loveda \
-  --dataset loveda \
-  --image_size 1024 \
-  --output_path outputsV2/ratio_prior.json
-
-python src/scripts/train_layout_d3pm.py \
-  --data_root /path/to/loveda \
-  --dataset loveda \
-  --output_dir outputs/layout_d3pm_masked \
-  --image_size 1024 \
-  --layout_size 256 \
-  --ratio_conditioning masked \
-  --p_keep 0.3 \
-  --known_count_max 3 \
-  --lambda_ratio 1.0 \
-  --lambda_prior 0.1 \
-  --ratio_prior_json outputsV2/ratio_prior.json
+  --config configs/compute_ratio_prior_loveda_train.yaml
 ```
 
-Stage B (ControlNet + FiLM ratio conditioning):
+#### Step 3: Train Image Generator (Stage B)
+
+Train the ControlNet model to synthesize images from layouts:
 
 ```bash
 python src/scripts/train_controlnet_ratio.py \
-  --pretrained_model_name_or_path /path/to/sd-v1-5 \
-  --data_root /path/to/loveda \
-  --dataset loveda \
-  --output_dir outputs/controlnet_ratio
+  --config configs/train_controlnet_ratio_loveda_1024.yaml
 ```
 
-You can also use the wrapper:
+### Inference
+
+#### Generate Image-Layout Pairs
 
 ```bash
-python src/scripts/main.py train_layout -- --data_root /path/to/loveda
-python src/scripts/main.py train_controlnet -- --data_root /path/to/loveda --base_model /path/to/sd-v1-5
-```
-
-## Sampling
-
-From scratch (ratios -> layout -> image):
-
-```bash
+# Using a config file
 python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_d3pm \
-  --controlnet_ckpt outputs/controlnet_ratio \
-  --base_model /path/to/sd-v1-5 \
-  --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
-  --save_dir outputs/sample_pair
-```
+  --config configs/sample_pair_ckpt40000_building0.4.yaml
 
-Sparse ratio constraints (works with Stage A checkpoints trained with `--ratio_conditioning masked`):
-
-```bash
+# Override config parameters via CLI
 python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_d3pm_masked \
-  --controlnet_ckpt outputs/controlnet_ratio \
-  --base_model /path/to/sd-v1-5 \
-  --ratios "water:0.15,agriculture:0.10" \
-  --save_dir outputs/sample_pair_sparse
+  --config configs/sample_pair_ckpt40000_building0.4.yaml \
+  --ratios "building:0.4,forest:0.3" \
+  --save_dir outputs/custom_generation
 ```
 
-Example (specific checkpoint + single-class ratio):
+---
 
-```bash
-# Using the YAML config (recommended)
-CUDA_VISIBLE_DEVICES=7 python3 \
-  src/scripts/sample_pair.py --config configs/sample_pair_ckpt40000_building0.4.yaml
+## 📁 Data Format
 
-# Equivalent CLI (for reference)
-CUDA_VISIBLE_DEVICES=7 python3 src/scripts/sample_pair.py \
-  --layout_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV3/layout_d3pm_masked_sparse_80k \
-  --layout_checkpoint 10000 \
-  --layout_diffusion_type d3pm \
-  --domain urban \
-  --domain_cond_scale 1.0 \
-  --controlnet_ckpt /data/inr/llm/DIFF_CD/Diffusor/outputsV3/controlnet_ratio_lora_ckpt18000_layout80000/checkpoint-40000 \
-  --base_model /home/nvidia/.cache/huggingface/hub/models--runwayml--stable-diffusion-v1-5/snapshots/451f4fe16113bff5a5d2269ed5ad43b0592e9a14 \
-  --save_dir /data/inr/llm/DIFF_CD/Diffusor/outputsV3/results_generator/gpu7 \
-  --ratios "building:0.4" \
-  --prompt "a high-resolution satellite image of an urban area" \
-  --image_size 1024 \
-  --num_inference_steps_layout 50 \
-  --num_inference_steps_image 30 \
-  --guidance_scale 1.0 \
-  --guidance_rescale 0.0 \
-  --control_scale 1.0 \
-  --seed 40000 \
-  --dtype fp16 \
-  --device cuda:0 \
-  --sampler ddim
+### LoveDA Dataset Structure
+
+```
+LoveDA/
+├── Train/
+│   ├── Urban/
+│   │   ├── images_png/
+│   │   └── masks_png/
+│   └── Rural/
+│       ├── images_png/
+│       └── masks_png/
+└── Val/
+    ├── Urban/
+    └── Rural/
 ```
 
-Img2img with a provided mask:
+### Generic Dataset Structure
 
-```bash
-python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_d3pm \
-  --controlnet_ckpt outputs/controlnet_ratio \
-  --base_model /path/to/sd-v1-5 \
-  --init_image /path/to/image.png \
-  --init_mask /path/to/mask.png \
-  --mask_format loveda_raw \
-  --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
-  --save_dir outputs/edited_pair
+For custom datasets, organize as:
+
+```
+your_dataset/
+├── images/
+│   ├── image_001.png
+│   └── image_002.png
+└── masks/
+    ├── image_001.png  # Label map with matching stem
+    └── image_002.png
 ```
 
-Image-only editing (auto mask init):
+---
 
-```bash
-python src/scripts/sample_pair.py \
-  --layout_ckpt outputs/layout_d3pm \
-  --controlnet_ckpt outputs/controlnet_ratio \
-  --base_model /path/to/sd-v1-5 \
-  --init_image /path/to/image.png \
-  --seg_ckpt /path/to/segmentation_state.pt \
-  --seg_arch simple \
-  --ratios "0.05,0.2,0.1,0.05,0.1,0.25,0.25" \
-  --save_dir outputs/edited_pair
+## ⚙️ Configuration
+
+All experiments are driven by YAML/JSON config files in `configs/`. This ensures reproducibility and makes it easy to share experimental setups.
+
+### Available Configs
+
+| Task | Config File | Description |
+|------|------------|-------------|
+| Layout Training | `train_layout_d3pm_masked_sparse_80k.yaml` | Train Stage A with 80k steps |
+| Ratio Prior | `compute_ratio_prior_loveda_train.yaml` | Compute class statistics |
+| ControlNet Training | `train_controlnet_ratio_loveda_1024.yaml` | Train Stage B at 1024px |
+| Sampling | `sample_pair_ckpt40000_building0.4.yaml` | Generate with 40% buildings |
+
+### Config Tips
+
+- 📝 All config examples are in `configs/`
+- 🔄 To resume training: set `resume_from_checkpoint: "checkpoint-XXXXX"` in your config
+- 🎯 Dataset paths and domains are centralized in configs—edit once, reuse everywhere
+- 🔧 CLI arguments override config values for quick experiments
+
+---
+
+## 📊 Outputs
+
+### Training Outputs
+
+Checkpoints include:
+- `training_config.json` - Complete training configuration
+- `class_names.json` - Class label mappings
+- Model weights and optimizer states
+
+### Sampling Outputs
+
+Each generated sample produces:
+- `image.png` - Synthetic RGB image
+- `layout.png` - Corresponding semantic layout
+- `metadata.json` - Generation parameters and class ratios
+
+---
+
+## 📦 Pre-Generated Datasets
+
+We provide synthetic datasets used in our paper:
+
+🔗 **[Download from Google Drive](https://drive.google.com/drive/folders/14cMpLTgvcLdXhRY0kGhFKpDRMvpok90h?usp=sharing)**
+
+These datasets demonstrate SyntheticGen's ability to generate balanced, high-quality remote sensing imagery for long-tail class mitigation.
+
+---
+
+## 📄 Citation
+
+If you find SyntheticGen useful in your research, please consider citing:
+
+```bibtex
+@article{syntheticgen2024,
+  title={Mitigating Long-Tail Bias in LoveDA via Prompt-Controlled Diffusion Augmentation},
+  author={Your Name and Collaborators},
+  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  year={2024}
+}
 ```
 
-Notes:
-- `--mask_format` supports `indexed` (0..K-1 with ignore) and `loveda_raw` (0=ignore, 1..K).
-- `--ignore_index` defaults to 255 and is respected when building one-hot layouts.
+---
 
-## Evaluation
+## 📝 License
 
-Ratio control metrics:
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-```bash
-python src/scripts/eval_ratio_control.py \
-  --layout_ckpt outputs/layout_d3pm \
-  --data_root /path/to/loveda \
-  --dataset loveda \
-  --num_samples 100
+---
+
+## 🙏 Acknowledgments
+
+- LoveDA dataset creators for providing high-quality annotated remote sensing data
+- The Hugging Face Diffusers team for excellent diffusion model infrastructure
+- ControlNet authors for the controllable generation framework
+
+---
+
+<div align="center">
+
+[Report Bug](https://github.com/yourusername/syntheticgen/issues) · [Request Feature](https://github.com/yourusername/syntheticgen/issues) · [Paper](https://arxiv.org/abs/your-paper-id)
+
+</div>
 ```
-
-Downstream segmentation utility:
-
-```bash
-python src/scripts/eval_downstream_segmentation.py \
-  --real_data_root /path/to/loveda \
-  --synthetic_data_root /path/to/synth_dataset \
-  --dataset loveda \
-  --output_path outputs/eval_downstream_segmentation.json
-```
-
-## Outputs
-
-Training scripts write `training_config.json` and `class_names.json` into the checkpoint directories.
-Sampling writes `image.png`, `layout.png`, and `metadata.json` to the output directory.
