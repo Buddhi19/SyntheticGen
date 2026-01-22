@@ -6,6 +6,8 @@
 
 *Addressing class imbalance in remote sensing datasets through controlled synthetic generation*
 
+**arXiv paper: coming soon!!**
+
 ![Paper](https://img.shields.io/badge/Paper-coming%20soon-lightgrey)
 [![Dataset](https://img.shields.io/badge/Dataset-Google%20Drive-blue)](https://drive.google.com/drive/folders/14cMpLTgvcLdXhRY0kGhFKpDRMvpok90h?usp=sharing)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
