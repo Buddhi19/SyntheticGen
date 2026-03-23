@@ -2,7 +2,7 @@
 
 # 🎨 SyntheticGen
 
-### Mitigating Long-Tail Bias in LoveDA via Prompt-Controlled Diffusion Augmentation
+### Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation
 
 *Addressing class imbalance in remote sensing datasets through controlled synthetic generation*
 
@@ -18,6 +18,9 @@
 ## 🌟 Overview
 
 **SyntheticGen** tackles the long-tail distribution problem in LoveDA by generating synthetic imagery with *explicit control* over class ratios. You can specify exactly what proportion of each land cover class should appear in the output.
+
+## 🔥🔥 Updates
+- Our paper was accepted to IGARSS 2026.
 
 ### ✨ Highlights
 - Two-stage pipeline: ratio-conditioned layout D3PM + ControlNet image synthesis.
