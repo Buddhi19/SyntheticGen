@@ -34,6 +34,33 @@
 
 ---
 
+## ❓ What we try to answer
+
+🛰️ **Why is remote-sensing segmentation still difficult, even with strong modern models?**  
+
+
+Because the problem is not only in the model — it is also in the data. Some land-cover classes appear again and again, while others are so rare that the model barely gets a chance to learn them. In LoveDA, this becomes even more challenging because the dataset is split into **Urban** and **Rural** domains, each with different scene characteristics and different class distributions.
+
+⚖️ **So what if we could control the data instead of just accepting it as it is?**  
+
+
+That is exactly the idea behind **SyntheticGen**. Instead of using augmentation as a random process, SyntheticGen makes it **controllable**. Users can explicitly specify target class ratios and domain conditions during generation, making it possible to create synthetic samples that are not just more numerous, but more *useful*. This means rare classes can be strengthened deliberately, while still preserving realistic layouts and domain-consistent appearance.
+
+🧠 **What makes SyntheticGen stand out?**  
+
+
+Its strength lies in a carefully designed **two-stage pipeline**. First, a **ratio-conditioned discrete diffusion model** generates semantically meaningful layouts. Then, a **ControlNet-guided image synthesis stage** converts those layouts into realistic remote-sensing imagery. By separating **semantic control** from **visual rendering**, the framework achieves something highly valuable: it is both **principled** and **practical**.
+
+🚀 **Why does that matter beyond this single benchmark?**  
+
+
+Because this is not just another generative model for remote sensing. SyntheticGen introduces a targeted augmentation strategy for improving segmentation under **class imbalance** and **domain shift**, and shows that synthetic data can be used not just to add more images, but to add the **right images**.
+
+🌍 **The bigger message**  
+
+
+SyntheticGen is a step toward **data-centric remote-sensing segmentation** — a setting where the training distribution is no longer passively accepted, but actively designed. Our paper shows that better segmentation is not only about building better models, but also about building better data.
+
 ## 🚀 Quick Start
 
 ### Installation
