@@ -201,13 +201,13 @@ https://drive.google.com/drive/folders/14cMpLTgvcLdXhRY0kGhFKpDRMvpok90h?usp=sha
 ## 📄 Citation
 ```bibtex
 @misc{wijenayake2026mitigating,
-      title={Mitigating Long-Tail Bias in LoveDA via Prompt-Controlled Diffusion Augmentation},
+      title={Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation}, 
       author={Buddhi Wijenayake and Nichula Wasalathilake and Roshan Godaliyadda and Vijitha Herath and Parakrama Ekanayake and Vishal M. Patel},
       year={2026},
       eprint={2602.04749},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2602.04749}
+      url={https://arxiv.org/abs/2602.04749}, 
 }
 ```
 
