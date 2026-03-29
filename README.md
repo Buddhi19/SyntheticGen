@@ -8,6 +8,7 @@
 
 [![Accepted at IEEE IGARSS 2026](https://img.shields.io/badge/Accepted-IEEE%20IGARSS%202026-1f77b4)](#)
 [![arXiv Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b)](https://arxiv.org/abs/2602.04749)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Colab-orange?logo=googlecolab&logoColor=white)](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)
 [![Dataset](https://img.shields.io/badge/Dataset-Google%20Drive-blue)](https://drive.google.com/drive/folders/14cMpLTgvcLdXhRY0kGhFKpDRMvpok90h?usp=sharing)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -20,6 +21,7 @@
 **SyntheticGen** tackles the long-tail distribution problem in LoveDA by generating synthetic imagery with *explicit control* over class ratios. You can specify exactly what proportion of each land cover class should appear in the output.
 
 ## 🔥🔥 Updates
+- 🚀 **Try SyntheticGen in 2 minutes — no setup required** at [**✨✨Live Demo✨✨**](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)
 - Our paper was accepted to EEE International Geoscience and Remote Sensing Symposium (IGARSS) 2026.
 
 ### ✨ Highlights
