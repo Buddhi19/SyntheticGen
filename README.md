@@ -69,6 +69,16 @@ git clone https://github.com/Buddhi19/SyntheticGen.git
 cd SyntheticGen
 pip install -r requirements.txt
 ```
+#### Install Dependencies
+```bash
+conda create -n diffusors python=3.10.19 -y
+conda activate diffusors
+
+# official PyTorch Linux + CUDA 12.8 install for v2.10.0
+python -m pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+
+python -m pip install -r SyntheticGen/requirements.txt
+```
 
 ### Generate Your First Synthetic Image
 ```bash
