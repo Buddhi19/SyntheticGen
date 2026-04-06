@@ -198,7 +198,7 @@ https://drive.google.com/drive/folders/14cMpLTgvcLdXhRY0kGhFKpDRMvpok90h?usp=sha
 
 ---
 
-## 📄 Citation
+## 📄 If you find our code/idea helpful, please cite
 ```bibtex
 @misc{wijenayake2026mitigating,
       title={Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation}, 
