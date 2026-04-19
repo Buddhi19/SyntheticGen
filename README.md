@@ -10,7 +10,7 @@
 [![arXiv Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b)](https://arxiv.org/abs/2602.04749)
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-Colab-orange?logo=googlecolab&logoColor=white)](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)
 [![Hugging Face Weights](https://img.shields.io/badge/Weights-Hugging%20Face-yellow?logo=huggingface&logoColor=black)](https://huggingface.co/buddhi19/SyntheticGen/tree/main)
-[![Dataset](https://img.shields.io/badge/Dataset-Google%20Drive-blue)](https://drive.google.com/drive/folders/14cMpLTgvcLdXhRY0kGhFKpDRMvpok90h?usp=sharing)
+[![Dataset](https://img.shields.io/badge/Datasets-Hugging%20Face-yellow?logo=huggingface&logoColor=black))](https://huggingface.co/datasets/buddhi19/SyntheticGenV5)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 </div>
@@ -23,6 +23,7 @@
 
 ## 🔥🔥 Updates
 - 🚀 **Try SyntheticGen in 2 minutes — no setup required** at [**✨✨Live Demo✨✨**](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)
+- 🤗 Synthetic Datasets Released at [**HuggingFace**](https://huggingface.co/datasets/buddhi19/SyntheticGenV5)
 - 🤗 Weights Released at [**HuggingFace**](https://huggingface.co/buddhi19/SyntheticGen/tree/main)
 - Our paper was accepted to EEE International Geoscience and Remote Sensing Symposium (IGARSS) 2026.
 
