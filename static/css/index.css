@@ -1,0 +1,503 @@
+body {
+  color: #222;
+  font-family: "Noto Sans", sans-serif;
+  overflow-x: hidden;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+a {
+  color: hsl(204, 86%, 53%);
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+.footer .icon-link {
+  color: #000;
+  font-size: 25px;
+}
+
+.link-block a {
+  margin-bottom: 5px;
+  margin-top: 5px;
+}
+
+.navbar {
+  box-shadow: none;
+}
+
+.navbar .brand {
+  color: #363636;
+  font-family: "Google Sans", sans-serif;
+  font-weight: 700;
+}
+
+.navbar-item {
+  font-family: "Google Sans", sans-serif;
+}
+
+.publication-hero .hero-body {
+  padding-bottom: 3rem;
+  padding-top: 3rem;
+}
+
+.publication-title {
+  color: #363636;
+  font-family: "Google Sans", sans-serif;
+  font-size: 2.65rem;
+  line-height: 1.18;
+  margin-bottom: 1.2rem;
+}
+
+.publication-summary {
+  color: #4a4a4a;
+  font-size: 1.08rem;
+  line-height: 1.6;
+  margin: 0 auto 1.25rem;
+  max-width: 900px;
+}
+
+.publication-authors {
+  font-family: "Google Sans", sans-serif;
+  font-size: 1.13rem;
+}
+
+.publication-authors a {
+  color: hsl(204, 86%, 53%) !important;
+}
+
+.publication-authors a:hover {
+  text-decoration: underline;
+}
+
+.author-block {
+  display: inline-block;
+  margin: 0 0.25rem 0.25rem;
+}
+
+.affiliation,
+.corresponding {
+  color: #555;
+  font-family: "Google Sans", sans-serif;
+  margin: 0.2rem 0;
+}
+
+.publication-links {
+  margin-top: 1.25rem;
+}
+
+.publication-links .button {
+  font-family: "Google Sans", sans-serif;
+  margin: 0.25rem;
+}
+
+.eyebrow {
+  color: #777;
+  font-family: "Google Sans", sans-serif;
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  margin-bottom: 0.5rem;
+  text-transform: none;
+}
+
+.section-heading {
+  margin-bottom: 1.5rem;
+}
+
+.section-heading .title,
+.title {
+  font-family: "Google Sans", sans-serif;
+}
+
+.lead {
+  color: #555;
+}
+
+.muted-section {
+  background: #f5f5f5;
+}
+
+.contribution-grid,
+.callout-grid,
+.image-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.contribution-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.callout-grid,
+.image-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.split-analysis {
+  margin-top: 2rem;
+}
+
+.split-analysis .figure-panel {
+  margin-bottom: 2rem;
+}
+
+.split-analysis img {
+  width: 100%;
+}
+
+.contribution,
+.callout {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 1rem;
+}
+
+.contribution h3,
+.callout h3 {
+  font-family: "Google Sans", sans-serif;
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin-bottom: 0.4rem;
+}
+
+.contribution p,
+.callout p {
+  color: #4a4a4a;
+}
+
+.qualitative-comparison {
+  margin: 1.5rem 0 2rem;
+}
+
+.qualitative-comparison .title {
+  margin-bottom: 1rem;
+}
+
+.qual-example-label {
+  color: #555;
+  font-family: "Google Sans", sans-serif;
+  font-weight: 700;
+  margin: 1rem 0 0.5rem;
+}
+
+.qual-row {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-bottom: 1rem;
+}
+
+.qual-row figure {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  margin: 0;
+  padding: 0.5rem;
+  text-align: center;
+}
+
+.qual-row img {
+  border-radius: 4px;
+  display: block;
+  height: auto;
+  width: 100%;
+}
+
+.qual-row figcaption {
+  color: #333;
+  font-family: "Google Sans", sans-serif;
+  font-size: 0.88rem;
+  line-height: 1.25;
+  margin-top: 0.45rem;
+}
+
+.step {
+  color: #777;
+  display: block;
+  font-family: "Google Sans", sans-serif;
+  font-size: 0.8rem;
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+
+.figure-panel {
+  margin: 0 0 1.5rem;
+  text-align: center;
+}
+
+.figure-panel img {
+  border-radius: 5px;
+  height: auto;
+  max-width: 100%;
+}
+
+.figure-panel figcaption {
+  color: #555;
+  font-size: 0.95rem;
+  margin: 0.5rem auto 0;
+  max-width: 900px;
+}
+
+.compact-figure {
+  margin-bottom: 0;
+}
+
+.fusion-wide {
+  margin-top: 1.25rem;
+}
+
+.fusion-wide img {
+  width: 100%;
+}
+
+.compact-figure figcaption {
+  color: #222;
+  font-size: 1.22rem;
+  line-height: 1.6;
+  max-width: 1100px;
+  padding: 0.35rem 0.5rem 0;
+}
+
+.compact-figure figcaption strong {
+  font-family: "Google Sans", sans-serif;
+}
+
+.method-columns {
+  margin-top: 1rem;
+}
+
+.metric-control {
+  justify-content: center;
+  margin-bottom: 1rem;
+}
+
+.metric-control .field-label {
+  flex-grow: 0;
+}
+
+.plots-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.plot-panel {
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  margin: 0;
+  padding: 1rem;
+}
+
+.plot-panel .title {
+  margin-bottom: 0.5rem;
+  text-align: center;
+}
+
+.metric-plot {
+  overflow: visible;
+}
+
+.metric-svg {
+  display: block;
+  height: auto;
+  width: 100%;
+}
+
+.grid-line {
+  stroke: #e8e8e8;
+  stroke-width: 1;
+}
+
+.axis-line {
+  stroke: #777;
+  stroke-width: 1;
+}
+
+.axis-title,
+.tick-label,
+.x-label,
+.dot-value {
+  fill: #333;
+  font-family: "Noto Sans", sans-serif;
+}
+
+.axis-title,
+.tick-label,
+.x-label {
+  font-size: 11px;
+}
+
+.dot-value {
+  font-size: 10px;
+}
+
+.dot-stem {
+  stroke: #d8d8d8;
+  stroke-dasharray: 2 3;
+  stroke-width: 1;
+}
+
+.plot-note {
+  color: #555;
+  font-size: 0.92rem;
+  margin-top: 0.75rem;
+  text-align: center;
+}
+
+.reproducibility-table {
+  font-size: 0.84rem;
+  line-height: 1.25;
+  margin-top: 0.75rem;
+}
+
+.reproducibility-table th {
+  color: #555;
+  font-family: "Google Sans", sans-serif;
+  font-weight: 700;
+  white-space: nowrap;
+  width: 18%;
+}
+
+.reproducibility-table td {
+  width: 32%;
+}
+
+.bibtex {
+  background: #f5f5f5;
+  border-radius: 5px;
+  color: #222;
+  font-size: 0.86rem;
+  overflow-x: auto;
+  padding: 1rem;
+  white-space: pre;
+}
+
+.footer {
+  background: #fafafa;
+  padding: 2.5rem 1.5rem;
+}
+
+.footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  justify-content: center;
+}
+
+@media screen and (max-width: 1024px) {
+  .contribution-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media screen and (max-width: 768px) {
+  .hero .container,
+  .section .container,
+  .columns,
+  .column {
+    margin-left: 0;
+    margin-right: 0;
+    max-width: 100%;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .column {
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .publication-title {
+    font-size: 1.85rem;
+    line-height: 1.18;
+    margin-left: 0;
+    margin-right: auto;
+    max-width: min(calc(100vw - 2rem), 356px);
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .publication-summary {
+    font-size: 1rem;
+    margin-left: 0;
+    margin-right: auto;
+    max-width: min(calc(100vw - 2rem), 356px);
+    text-align: left;
+  }
+
+  .publication-hero .has-text-centered {
+    text-align: left !important;
+  }
+
+  .publication-authors,
+  .affiliation,
+  .corresponding,
+  .publication-links,
+  .content,
+  .lead,
+  .section-heading,
+  .contribution-grid,
+  .callout-grid,
+  .image-grid,
+  .plots-grid,
+  .figure-panel,
+  .plot-note,
+  .split-analysis,
+  .metric-control {
+    margin-left: 0;
+    margin-right: auto;
+    max-width: min(calc(100vw - 2rem), 356px);
+  }
+
+  .publication-links {
+    text-align: left;
+  }
+
+  .has-text-justified {
+    text-align: left !important;
+  }
+
+  .publication-links .button {
+    min-width: 8rem;
+  }
+
+  .callout-grid,
+  .image-grid,
+  .plots-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .qual-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .reproducibility-table,
+  .reproducibility-table tbody,
+  .reproducibility-table tr,
+  .reproducibility-table th,
+  .reproducibility-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .reproducibility-table tr {
+    border-bottom: 1px solid #eee;
+    padding: 0.35rem 0;
+  }
+
+  .reproducibility-table th {
+    padding-bottom: 0;
+  }
+
+  .reproducibility-table td {
+    padding-top: 0.15rem;
+  }
+}
