@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="SyntheticGen mitigates long-tail bias in LoveDA remote-sensing segmentation with prompt-controlled diffusion augmentation.">
-  <meta name="keywords" content="SyntheticGen, prompt-controlled diffusion augmentation, long-tail bias, remote sensing, semantic segmentation, LoveDA, D3PM, ControlNet">
+  <meta name="description" content="SyntheticGen is a controllable diffusion augmentation framework for long-tailed semantic segmentation under domain shift, demonstrated on LoveDA.">
+  <meta name="keywords" content="SyntheticGen, controllable augmentation, prompt-controlled diffusion, long-tail bias, domain shift, remote sensing, semantic segmentation, LoveDA, D3PM, ControlNet, data-centric AI">
   <meta property="og:title" content="SyntheticGen">
-  <meta property="og:description" content="Prompt-controlled synthetic image-label generation for long-tailed remote-sensing segmentation.">
+  <meta property="og:description" content="Controllable diffusion augmentation for long-tailed semantic segmentation under domain shift.">
   <meta property="og:type" content="website">
   <meta property="og:image" content="./resources/syntheticgen_dataset.jpg">
-  <title>SyntheticGen: Prompt-Controlled Diffusion Augmentation</title>
+  <title>SyntheticGen: Controllable Diffusion Augmentation for Long-Tailed Segmentation</title>
 
   <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
   <link rel="stylesheet" href="./static/css/bulma.min.css">
@@ -33,6 +33,8 @@
   </div>
   <div id="main-nav" class="navbar-menu">
     <div class="navbar-end">
+      <a class="navbar-item" href="#abstract">Abstract</a>
+      <a class="navbar-item" href="#why">Core Contributions</a>
       <a class="navbar-item" href="#method">Method</a>
       <a class="navbar-item" href="#results">Results</a>
       <a class="navbar-item" href="#analysis">Analysis</a>
@@ -53,7 +55,8 @@
               Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation
             </h1>
             <p class="subtitle publication-summary">
-              SyntheticGen turns augmentation into a controllable data-design step for LoveDA: a ratio-conditioned D3PM first generates semantic layouts, then a ControlNet-guided latent diffusion model renders domain-consistent satellite images. Adding 2,000 accepted synthetic image-label pairs improves in-domain segmentation across U-Net, PSPNet, FactSeg, HRNet, and AerialFormer, with the largest gains on minority and mid-tail classes.
+              <strong>SyntheticGen turns augmentation into controllable data design.</strong> Instead of adding more samples at random, it generates the missing semantic compositions in the right domain, a ratio-conditioned D3PM first synthesizes semantic layouts, then a ControlNet-guided latent diffusion model renders domain-consistent satellite images.
+              We show better segmentation does not only come from better architectures, it can also come from deliberately generating the training distribution that real data is missing.
             </p>
 
             <div class="publication-authors">
@@ -106,7 +109,7 @@
           <h2 class="title is-3">Abstract</h2>
           <div class="content has-text-justified">
             <p>
-            Long-tailed class imbalance remains a fundamental obstacle in semantic segmentation of high-resolution remote-sensing imagery, where dominant classes shape learned representations and rare classes are systematically under-segmented. This challenge becomes more acute in cross-domain settings such as LoveDA, which exhibits an explicit Urban/Rural split with substantial appearance differences and inconsistent class-frequency statistics across domains. We propose a prompt-controlled diffusion augmentation framework that generates paired label-image samples with explicit control over semantic composition and domain, enabling targeted enrichment of underrepresented classes rather than indiscriminate dataset expansion. A domain-aware, masked, ratio-conditioned discrete diffusion model first synthesizes layouts that satisfy class-ratio targets while preserving realistic spatial co-occurrence, and a ControlNet-guided diffusion model then renders photorealistic, domain-consistent images from these layouts. When mixed with real data, the resulting synthetic pairs improve multiple segmentation backbones, especially on minority classes and under domain shift, showing that better downstream segmentation comes from adding the right samples in the right proportions.
+              Long-tailed class imbalance remains a major obstacle in semantic segmentation of high-resolution remote-sensing imagery, where frequent classes dominate optimization and rare classes are systematically under-segmented. The problem becomes harder under domain shift: LoveDA explicitly separates Urban and Rural scenes, whose appearance statistics and class frequencies differ substantially. SyntheticGen addresses both challenges with a prompt-controlled diffusion augmentation framework that generates paired label-image samples with explicit control over semantic composition and domain. A domain-aware, masked, ratio-conditioned discrete diffusion model first synthesizes semantic layouts that satisfy class-ratio targets while preserving realistic co-occurrence structure, and a ControlNet-guided latent diffusion model then renders photorealistic, domain-consistent images from those layouts. When mixed with real data, the resulting synthetic pairs improve multiple segmentation backbones, especially on minority and mid-tail classes and in cross-domain evaluation, showing that better downstream segmentation can come from adding the right samples in the right proportions.
             </p>
           </div>
         </div>
@@ -118,32 +121,31 @@
     <div class="container is-max-widescreen">
       <div class="columns is-variable is-6">
         <div class="column is-one-third">
-          <h2 class="title is-3">Data-centric control for long tails</h2>
+          <h2 class="title is-3">Core Contributions</h2>
           <p class="lead">
-            SyntheticGen treats class imbalance as a distribution-design problem: ask for the missing semantic composition, generate it, validate it, and train segmentation models on the enriched set.
+        When semantic labels, class imbalance, and appearance shift coexist, the training distribution can be deliberately reshaped instead of passively inherited.
           </p>
         </div>
         <div class="column">
           <div class="contribution-grid">
             <article class="contribution">
               <span class="step">01</span>
-              <h3>Ratio-conditioned layouts</h3>
-              <p>Stage A uses a discrete diffusion model over semantic label maps, conditioned on Urban/Rural domain identity and masked class-ratio targets.</p>
+              <h3>Controllable augmentation</h3>
+              <p>Stage A operates directly on semantic maps and can target selected class ratios, turning augmentation from random synthesis into controlled distribution shaping.</p>
             </article>
             <article class="contribution">
               <span class="step">02</span>
-              <h3>Layout-faithful images</h3>
-              <p>Stage B converts those layouts into satellite imagery with Stable Diffusion, ControlNet guidance, CLIP prompt conditioning, and FiLM-gated residual injection.</p>
+              <h3>Domain-aware generation</h3>
+              <p>Layouts are generated and rendered with Urban/Rural awareness, so the synthetic samples match the appearance statistics of the domain where data is lacking.</p>
             </article>
             <article class="contribution">
               <span class="step">03</span>
-              <h3>Measured segmentation gains</h3>
-              <p>The accepted synthetic set adds 894 Rural and 1,106 Urban image-label pairs, improving all reported in-domain mIoU scores and both domain-transfer directions.</p>
+              <h3>Backbone-agnostic gains</h3>
+              <p>The synthetic set adds 894 Rural and 1,106 Urban image-label pairs and improves all reported in-domain mIoU scores as well as both domain-transfer directions.</p>
             </article>
           </div>
         </div>
       </div>
-    </div>
   </section>
 
   <section class="section muted-section" id="method">
@@ -167,8 +169,8 @@
               <li>Downsample the semantic map to a 256 by 256 one-hot layout and train a D3PM denoiser over categorical labels.</li>
               <li>Condition the denoiser on a masked ratio target and a learnable Urban/Rural domain embedding so the model supports full or sparse ratio control.</li>
               <li>Train Stage A with a variational diffusion term, a 0.5-weighted denoising cross-entropy term, and a ratio-matching loss that emphasizes constrained classes.</li>
-              <li>Train Stage B with a latent diffusion noise-prediction objective, using one-hot layouts through ControlNet and domain/ratio prompts through CLIP text embeddings.</li>
-              <li>Build the final synthetic corpus with a greedy enrichment loop that targets the most underrepresented non-background classes in each domain.</li>
+              <li>Train Stage B with a latent diffusion noise-prediction objective, using one-hot layouts through ControlNet and domain and ratio prompts through CLIP text embeddings.</li>
+              <li>Build the final synthetic corpus with a greedy enrichment loop that repeatedly targets the most underrepresented non-background classes in each domain.</li>
             </ol>
           </div>
         </div>
@@ -176,12 +178,12 @@
 
       <div class="image-grid">
         <figure class="figure-panel compact-figure">
-          <img src="./resources/syntheticgen_stage_a.jpg" alt="Stage A ratio and domain conditioned D3PM layout generator.">
+          <img src="./resources/syntheticgen_stage_a.jpg" alt="Stage A ratio- and domain-conditioned D3PM layout generator.">
           <figcaption>Stage A: a U-Net denoiser predicts categorical logits from a noisy layout under masked ratio and domain conditioning.</figcaption>
         </figure>
         <figure class="figure-panel compact-figure">
-          <img src="./resources/syntheticgen_stage_b.jpg" alt="Stage B layout guided latent diffusion image generator.">
-          <figcaption>Stage B: ControlNet injects layout-conditioned features into Stable Diffusion, with FiLM gates regulating residual strength.</figcaption>
+          <img src="./resources/syntheticgen_stage_b.jpg" alt="Stage B layout-guided latent diffusion image generator.">
+          <figcaption>Stage B: ControlNet injects layout-conditioned features into Stable Diffusion, while FiLM gates regulate residual strength.</figcaption>
         </figure>
       </div>
     </div>
@@ -222,12 +224,12 @@
           <div id="plot-domain" class="metric-plot" role="img" aria-label="Domain generalization Original versus Original+Synthetic comparison plot"></div>
         </figure>
       </div>
-      <p class="plot-note">Each pair compares the same segmentation backbone trained on LoveDA Original data and Original+Synthetic data.</p>
+      <p class="plot-note">Each pair compares the same segmentation backbone trained on LoveDA Original data and LoveDA Original+Synthetic data.</p>
 
       <div class="callout-grid">
         <div class="callout">
           <h3>In-domain gains</h3>
-          <p>All five backbones improve in mIoU. U-Net shows the largest jump, from 39.77 to 51.36 mIoU, while AerialFormer reaches the highest reported in-domain mIoU at 54.26.</p>
+          <p>All five backbones improve in mIoU. U-Net shows the largest jump, from 39.77 to 51.36 mIoU, while AerialFormer reaches the highest reported in-domain mIoU among the tested models at 54.26.</p>
         </div>
         <div class="callout">
           <h3>Cross-domain gains</h3>
@@ -246,44 +248,33 @@
 
       <div class="generated-results">
         <figure>
+          <img src="./resources/6.png" alt="Generated synthetic result for a rural prompt with road, water, and forest ratio constraints.">
+          <figcaption>A high-resolution satellite image of a rural area with 30% road, 20% water, and 10% forest.</figcaption>
+        </figure>
+        <figure>
+          <img src="./resources/5.png" alt="Generated synthetic result for a rural prompt with a road ratio constraint.">
+          <figcaption>A high-resolution remote-sensing image of a rural area with 5% road.</figcaption>
+        </figure>
+        <figure>
+          <img src="./resources/4.png" alt="Generated synthetic result for a rural prompt with forest and barren ratio constraints.">
+          <figcaption>A satellite image of a rural area with 30% forest and 30% barren.</figcaption>
+        </figure>
+        <figure>
           <img src="./resources/3.png" alt="Generated synthetic result for a rural prompt with water and forest ratio constraints.">
-          <figcaption>A satellite image of a rural area with 20% Water and 10% Forest.</figcaption>
+          <figcaption>A satellite image of a rural area with 20% water and 10% forest.</figcaption>
         </figure>
         <figure>
           <img src="./resources/2.png" alt="Generated synthetic result for a rural prompt with a building ratio constraint.">
-          <figcaption>A high-reesolution remote sensing image of a rural area with 30% Building.</figcaption>
+          <figcaption>A high-resolution remote-sensing image of a rural area with 30% building.</figcaption>
         </figure>
         <figure>
           <img src="./resources/1.png" alt="Generated synthetic result for an urban prompt with a building ratio constraint.">
-          <figcaption>A high resolution satellite image of an urban area with 30% Building.</figcaption>
+          <figcaption>A high-resolution satellite image of an urban area with 30% building.</figcaption>
         </figure>
       </div>
     </div>
   </section>
 
-  <section class="section" id="reproducibility">
-    <div class="container is-max-desktop">
-      <div class="columns is-centered">
-        <div class="column is-four-fifths">
-          <p class="eyebrow">Reproducibility</p>
-          <h2 class="title is-3">Implementation details</h2>
-          <p class="lead">
-            The paper reports a config-driven pipeline for controlled layout generation, layout-guided image synthesis, and downstream segmentation evaluation on the official LoveDA validation split.
-          </p>
-          <table class="table is-narrow is-fullwidth reproducibility-table">
-            <tbody>
-              <tr><th>Dataset</th><td>LoveDA Urban and Rural domains</td><th>Classes</th><td>Background, building, road, water, barren, forest, agriculture</td></tr>
-              <tr><th>Stage A</th><td>Ratio and domain conditioned D3PM</td><th>Layout size</th><td>256 by 256 one-hot semantic maps</td></tr>
-              <tr><th>Conditioning</th><td>Masked class-ratio vector plus domain embedding</td><th>Stage A loss</th><td>VLB + 0.5 CE + ratio matching</td></tr>
-              <tr><th>Stage B</th><td>Stable Diffusion with ControlNet guidance</td><th>Prompt signal</th><td>Domain and class-ratio text encoded with CLIP</td></tr>
-              <tr><th>Synthetic set</th><td>2,000 accepted pairs</td><th>Domain split</th><td>894 Rural and 1,106 Urban</td></tr>
-              <tr><th>Backbones</th><td>U-Net, PSPNet, FactSeg, HRNet, AerialFormer</td><th>Metrics</th><td>Per-class IoU, mIoU, mF1, OA</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  </section>
 
   <section class="section muted-section" id="limitations">
     <div class="container is-max-desktop">
@@ -293,7 +284,10 @@
       </div>
       <div class="content has-text-justified">
         <p>
-          SyntheticGen shows that diffusion augmentation is most useful for long-tailed segmentation when it is controllable. The framework does not merely add more images; it asks for domain-specific semantic compositions that the real training set lacks, checks whether candidates satisfy those constraints, and uses the accepted pairs to improve segmentation models under imbalance and domain shift.
+          SyntheticGen shows that diffusion augmentation is most useful for long-tailed segmentation when it is controllable. The framework does not simply add more images; it asks for domain-specific semantic compositions that the real training set lacks, checks whether generated candidates satisfy those constraints, and uses the accepted pairs to improve segmentation models under imbalance and domain shift.
+        </p>
+        <p>
+          The current evidence is on LoveDA, but the broader research message is more general: when the data distribution is the bottleneck, controllable generation can be used to reshape that distribution rather than only reweighting the loss or changing the backbone.
         </p>
       </div>
     </div>
@@ -303,21 +297,17 @@
     <div class="container is-max-desktop">
       <div class="section-heading">
         <p class="eyebrow">Citation</p>
-        <h2 class="title is-3">Cite SyntheticGen</h2>
+        <h2 class="title is-3">BibTex</h2>
       </div>
       <div class="content">
-        <p>
-          Wijenayake, B., Wasalathilake, N., Godaliyadda, R., Herath, V., Ekanayake, P., and Patel, V. M.,
-          "Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation," arXiv:2602.04749, 2026.
-        </p>
         <pre class="bibtex"><code>@article{wijenayake2026mitigatinglongtailbiaspromptcontrolled,
-      title={Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation}, 
+      title={Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation},
       author={Buddhi Wijenayake and Nichula Wasalathilake and Roshan Godaliyadda and Vijitha Herath and Parakrama Ekanayake and Vishal M. Patel},
       year={2026},
       eprint={2602.04749},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2602.04749}, 
+      url={https://arxiv.org/abs/2602.04749},
 }</code></pre>
       </div>
     </div>
