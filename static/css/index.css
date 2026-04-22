@@ -177,6 +177,36 @@ a:hover {
   margin: 1.5rem 0 2rem;
 }
 
+.generated-results {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-bottom: 2rem;
+}
+
+.generated-results figure {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  margin: 0;
+  padding: 0.6rem;
+}
+
+.generated-results img {
+  border-radius: 4px;
+  display: block;
+  height: auto;
+  width: 100%;
+}
+
+.generated-results figcaption {
+  color: #333;
+  font-family: "Google Sans", sans-serif;
+  font-size: 0.9rem;
+  line-height: 1.35;
+  margin-top: 0.55rem;
+}
+
 .qualitative-comparison .title {
   margin-bottom: 1rem;
 }
@@ -471,7 +501,8 @@ a:hover {
 
   .callout-grid,
   .image-grid,
-  .plots-grid {
+  .plots-grid,
+  .generated-results {
     grid-template-columns: 1fr;
   }
 

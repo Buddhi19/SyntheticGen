@@ -57,15 +57,15 @@
             </p>
 
             <div class="publication-authors">
-              <span class="author-block"><a href="https://scholar.google.com/citations?user=HDFMos8AAAAJ">Buddhi Wijenayake</a></span>
-              <span class="author-block">Nichula Wasalathilake</span>
-              <span class="author-block"><a href="https://scholar.google.com/citations?user=6_XOJbsAAAAJ">Roshan Godaliyadda</a></span>
-              <span class="author-block"><a href="https://scholar.google.com/citations?user=f5h5ByUAAAAJ">Vijitha Herath</a></span>
-              <span class="author-block"><a href="https://scholar.google.com/citations?user=uJvb7zwAAAAJ">Parakrama Ekanayake</a></span>
-              <span class="author-block"><a href="https://scholar.google.com/citations?user=AkEXTbIAAAAJ">Vishal M. Patel</a></span>
+              <span class="author-block"><a href="https://scholar.google.com/citations?user=HDFMos8AAAAJ">Buddhi Wijenayake</a><sup>1</sup></span>
+              <span class="author-block"><a href="https://scholar.google.com/citations?user=704xSSwAAAAJ">Nichula Wasalathilake</a><sup>1</sup></span>
+              <span class="author-block"><a href="https://scholar.google.com/citations?user=6_XOJbsAAAAJ">Roshan Godaliyadda</a><sup>1</sup></span>
+              <span class="author-block"><a href="https://scholar.google.com/citations?user=f5h5ByUAAAAJ">Vijitha Herath</a><sup>1</sup></span>
+              <span class="author-block"><a href="https://scholar.google.com/citations?user=uJvb7zwAAAAJ">Parakrama Ekanayake</a><sup>1</sup></span>
+              <span class="author-block"><a href="https://scholar.google.com/citations?user=AkEXTbIAAAAJ">Vishal M. Patel</a><sup>2</sup></span>
             </div>
 
-            <p class="affiliation">University of Peradeniya, Sri Lanka &nbsp;|&nbsp; Johns Hopkins University, USA</p>
+            <p class="affiliation"><sup>1</sup> University of Peradeniya, Sri Lanka &nbsp;|&nbsp; <sup>2</sup> Johns Hopkins University, USA</p>
 
             <div class="publication-links">
               <a href="https://arxiv.org/pdf/2602.04749" class="external-link button is-normal is-rounded is-dark">
@@ -240,50 +240,23 @@
   <section class="section muted-section" id="analysis">
     <div class="container is-max-widescreen">
       <div class="section-heading">
-        <p class="eyebrow">Dataset and long-tail evidence</p>
-        <h2 class="title is-3">Controlled synthetic data changes the training distribution</h2>
+        <p class="eyebrow">Generated examples</p>
+        <h2 class="title is-3">Prompt-controlled synthetic results</h2>
       </div>
 
-      <figure class="figure-panel">
-        <img src="./resources/syntheticgen_dataset.jpg" alt="SyntheticGen dataset balancing and prompt controlled generated samples.">
-        <figcaption>Dataset balancing and prompt-controllable synthesis on LoveDA. The generated pairs increase exposure to minority classes while preserving Urban/Rural visual style and semantic layout consistency.</figcaption>
-      </figure>
-
-      <div class="columns is-variable is-6">
-        <div class="column">
-          <div class="content">
-            <h3 class="title is-4">What improves</h3>
-            <ul>
-              <li>Minority and mid-tail classes receive more effective pixel exposure without simply duplicating real examples.</li>
-              <li>Road, water, agriculture, forest, and building categories show large improvements in several models and transfer settings.</li>
-              <li>The gains persist across CNN-style and transformer-style segmentation backbones, suggesting the synthetic data helps the training distribution rather than one architecture only.</li>
-            </ul>
-          </div>
-        </div>
-        <div class="column">
-          <div class="content">
-            <h3 class="title is-4">What remains open</h3>
-            <ul>
-              <li>Ratio adherence can degrade when requested targets are far outside the learned co-occurrence statistics.</li>
-              <li>The evaluation is limited to LoveDA, so broader validation is needed across additional remote-sensing datasets and label taxonomies.</li>
-              <li>Future extensions could combine ratio control with active learning, uncertainty filtering, or domain adaptation for larger-scale deployment.</li>
-            </ul>
-          </div>
-        </div>
-      </div>
-
-      <div class="split-analysis">
-        <h3 class="title is-4">Per-class highlights</h3>
-        <div class="callout-grid">
-          <div class="callout">
-            <h3>Largest in-domain class jump</h3>
-            <p>U-Net agriculture improves from 23.11 to 52.64 IoU, a +29.53 point gain after adding SyntheticGen data.</p>
-          </div>
-          <div class="callout">
-            <h3>Strong transfer class jump</h3>
-            <p>FactSeg Rural-to-Urban road IoU improves from 18.88 to 49.17, a +30.29 point gain under domain generalization.</p>
-          </div>
-        </div>
+      <div class="generated-results">
+        <figure>
+          <img src="./resources/3.png" alt="Generated synthetic result for a rural prompt with water and forest ratio constraints.">
+          <figcaption>A satellite image of a rural area with 20% Water and 10% Forest.</figcaption>
+        </figure>
+        <figure>
+          <img src="./resources/2.png" alt="Generated synthetic result for a rural prompt with a building ratio constraint.">
+          <figcaption>A high-reesolution remote sensing image of a rural area with 30% Building.</figcaption>
+        </figure>
+        <figure>
+          <img src="./resources/1.png" alt="Generated synthetic result for an urban prompt with a building ratio constraint.">
+          <figcaption>A high resolution satellite image of an urban area with 30% Building.</figcaption>
+        </figure>
       </div>
     </div>
   </section>
@@ -337,14 +310,14 @@
           Wijenayake, B., Wasalathilake, N., Godaliyadda, R., Herath, V., Ekanayake, P., and Patel, V. M.,
           "Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation," arXiv:2602.04749, 2026.
         </p>
-        <pre class="bibtex"><code>@misc{wijenayake2026mitigating,
-  title={Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation},
-  author={Buddhi Wijenayake and Nichula Wasalathilake and Roshan Godaliyadda and Vijitha Herath and Parakrama Ekanayake and Vishal M. Patel},
-  year={2026},
-  eprint={2602.04749},
-  archivePrefix={arXiv},
-  primaryClass={cs.CV},
-  url={https://arxiv.org/abs/2602.04749}
+        <pre class="bibtex"><code>@article{wijenayake2026mitigatinglongtailbiaspromptcontrolled,
+      title={Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation}, 
+      author={Buddhi Wijenayake and Nichula Wasalathilake and Roshan Godaliyadda and Vijitha Herath and Parakrama Ekanayake and Vishal M. Patel},
+      year={2026},
+      eprint={2602.04749},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2602.04749}, 
 }</code></pre>
       </div>
     </div>

@@ -1,12 +1,9 @@
-@article{wijenayake2026mambafcs,
-  author  = {Buddhi Wijenayake and Athulya Ratnayake and Praveen Sumanasekara and
-             Roshan Godaliyadda and Parakrama Ekanayake and Vijitha Herath and
-             Nichula Wasalathilaka},
-  title   = {Mamba-FCS: Joint Spatio-Frequency Feature Fusion, Change-Guided Attention,
-             and SeK Inspired Loss for Enhanced Semantic Change Detection in Remote Sensing},
-  journal = {IEEE Journal of Selected Topics in Applied Earth Observations and Remote Sensing},
-  volume  = {19},
-  pages   = {7680--7698},
-  year    = {2026},
-  doi     = {10.1109/JSTARS.2026.3663066}
+@article{wijenayake2026mitigatinglongtailbiaspromptcontrolled,
+      title={Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation}, 
+      author={Buddhi Wijenayake and Nichula Wasalathilake and Roshan Godaliyadda and Vijitha Herath and Parakrama Ekanayake and Vishal M. Patel},
+      year={2026},
+      eprint={2602.04749},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2602.04749}, 
 }
