@@ -11,8 +11,8 @@
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-Colab-orange?logo=googlecolab&logoColor=white)](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)
 [![Hugging Face Weights](https://img.shields.io/badge/Weights-Hugging%20Face-yellow?logo=huggingface&logoColor=black)](https://huggingface.co/buddhi19/SyntheticGen/tree/main)
 [![Dataset](https://img.shields.io/badge/Datasets-Hugging%20Face-yellow?logo=huggingface&logoColor=black))](https://huggingface.co/datasets/buddhi19/SyntheticGenV5)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+🌐 [**Project Page**](https://buddhi19.github.io/SyntheticGen/)
 </div>
 
 ---
@@ -22,7 +22,7 @@
 **SyntheticGen** tackles the long-tail distribution problem in LoveDA by generating synthetic imagery with *explicit control* over class ratios. You can specify exactly what proportion of each land cover class should appear in the output.
 
 ## 🔥🔥 Updates
-- 🚀 **Try SyntheticGen in 2 minutes — no setup required** at [**✨✨Live Demo✨✨**](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)
+### - 🚀 **Try SyntheticGen in 2 minutes — no setup required** at [**✨✨Live Demo✨✨**](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)
 - 🤗 Synthetic Datasets Released at [**HuggingFace**](https://huggingface.co/datasets/buddhi19/SyntheticGenV5)
 - 🤗 Weights Released at [**HuggingFace**](https://huggingface.co/buddhi19/SyntheticGen/tree/main)
 - Our paper was accepted to EEE International Geoscience and Remote Sensing Symposium (IGARSS) 2026.
