@@ -188,8 +188,7 @@ your_dataset/
 
 ## 📦 Pre-Generated Datasets
 
-We provide synthetic datasets used in the paper:
-https://drive.google.com/drive/folders/14cMpLTgvcLdXhRY0kGhFKpDRMvpok90h?usp=sharing
+### We provide synthetic datasets used in the paper at [🤗 HuggingFace](https://huggingface.co/datasets/buddhi19/SyntheticGenV5)
 
 ---
 
