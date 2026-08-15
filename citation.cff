@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+
+message: "If you use SyntheticGen in your research, please cite the associated paper using the preferred citation below."
+
+type: software
+
+title: "SyntheticGen"
+
+authors:
+  - family-names: "Wijenayake"
+    given-names: "Buddhi"
+  - family-names: "Wasalathilake"
+    given-names: "Nichula"
+  - family-names: "Godaliyadda"
+    given-names: "Roshan"
+  - family-names: "Herath"
+    given-names: "Vijitha"
+  - family-names: "Ekanayake"
+    given-names: "Parakrama"
+  - family-names: "Patel"
+    given-names: "Vishal M."
+
+repository-code: "https://github.com/Buddhi19/SyntheticGen"
+url: "https://buddhi19.github.io/SyntheticGen/"
+license: MIT
+
+preferred-citation:
+  type: article
+  title: "Mitigating Long-Tail Bias via Prompt-Controlled Diffusion Augmentation"
+  authors:
+    - family-names: "Wijenayake"
+      given-names: "Buddhi"
+    - family-names: "Wasalathilake"
+      given-names: "Nichula"
+    - family-names: "Godaliyadda"
+      given-names: "Roshan"
+    - family-names: "Herath"
+      given-names: "Vijitha"
+    - family-names: "Ekanayake"
+      given-names: "Parakrama"
+    - family-names: "Patel"
+      given-names: "Vishal M."
+  year: 2026
+  doi: 10.48550/arXiv.2602.04749
+  url: "https://arxiv.org/abs/2602.04749"
