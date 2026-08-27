@@ -8,7 +8,7 @@
 
 [![Accepted at IEEE IGARSS 2026](https://img.shields.io/badge/Accepted-IEEE%20IGARSS%202026-1f77b4)](#)
 [![arXiv Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b)](https://arxiv.org/abs/2602.04749)
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-Colab-orange?logo=googlecolab&logoColor=white)](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)
+**[![Live Demo](https://img.shields.io/badge/Live%20Demo-Colab-orange?logo=googlecolab&logoColor=white)](https://colab.research.google.com/drive/11KqBQogdIjwC6UXAGVeD4cfq_VclUC_I?usp=sharing)**
 [![Hugging Face Weights](https://img.shields.io/badge/Weights-Hugging%20Face-yellow?logo=huggingface&logoColor=black)](https://huggingface.co/buddhi19/SyntheticGen/tree/main)
 [![Dataset](https://img.shields.io/badge/Datasets-Hugging%20Face-yellow?logo=huggingface&logoColor=black))](https://huggingface.co/datasets/buddhi19/SyntheticGenV5)
 
